@@ -11,6 +11,10 @@ pub enum Action {
     Right,
     Open,
     Refresh,
+    Start,
+    Stop,
+    Confirm,
+    Cancel,
 }
 
 impl Action {
@@ -33,6 +37,10 @@ impl Action {
             KeyCode::Left => Self::Left,
             KeyCode::Right => Self::Right,
             KeyCode::Enter => Self::Open,
+            KeyCode::Char('s') => Self::Start,
+            KeyCode::Char('x') => Self::Stop,
+            KeyCode::Char('y') => Self::Confirm,
+            KeyCode::Char('n') | KeyCode::Esc => Self::Cancel,
             _ => return None,
         })
     }

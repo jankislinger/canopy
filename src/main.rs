@@ -22,7 +22,11 @@ async fn main() -> color_eyre::Result<()> {
         &mut terminal,
         &mut rx,
         tx,
-        app::AppState::new(home, repositories),
+        app::AppState::new(
+            home,
+            repositories,
+            backend::sessions::SessionBackend::default(),
+        ),
     )
     .await;
     ratatui::try_restore()?;

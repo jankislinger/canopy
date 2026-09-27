@@ -1,5 +1,6 @@
 use crate::{
     action::Action,
+    backend::sessions::{Session, SessionBackend},
     backend::{Project, ProjectKind, Repository},
     ui,
 };
@@ -7,7 +8,6 @@ use ratatui::DefaultTerminal;
 use std::{
     collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
-    process::Command,
 };
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -22,10 +22,17 @@ pub struct AppState {
     pub completed: usize,
     pub spinner: usize,
     pub status: String,
+    pub sessions: Vec<Session>,
+    pub session_backend: SessionBackend,
+    pub stop_confirmation: bool,
 }
 impl AppState {
     /// Creates application state with the discovered tree expanded.
-    pub fn new(home: PathBuf, repositories: Vec<Repository>) -> Self {
+    pub fn new(
+        home: PathBuf,
+        repositories: Vec<Repository>,
+        session_backend: SessionBackend,
+    ) -> Self {
         let expanded = all_dirs(&home, &repositories);
         let selected = rows(&home, &repositories, &expanded)
             .first()
@@ -40,6 +47,9 @@ impl AppState {
             completed: 0,
             spinner: 0,
             status: String::new(),
+            sessions: session_backend.list().unwrap_or_default(),
+            session_backend,
+            stop_confirmation: false,
         }
     }
 }
@@ -53,7 +63,7 @@ pub async fn run(
     let mut tick = time::interval(Duration::from_millis(150));
     loop {
         t.draw(|f| ui::draw(f, &s))?;
-        tokio::select! {a=rx.recv()=>match a{Some(Action::Quit)|None=>break,Some(Action::Up)=>select(&mut s,-1),Some(Action::Down)=>select(&mut s,1),Some(Action::Left)=>{if has_child(&s){s.expanded.remove(&s.selected);}},Some(Action::Right)=>{if has_child(&s){s.expanded.insert(s.selected.clone());}},Some(Action::Open)=>{if project(&s.repositories,&s.selected).is_some(){ratatui::try_restore()?;Command::new("nvim").current_dir(&s.selected).status()?;*t=ratatui::try_init()?}},Some(Action::Refresh)=>{let r=crate::backend::discover_repositories(&s.home)?;s=AppState::new(s.home.clone(),r);s.status="Refreshed".into()},Some(Action::Wait)=>{s.loading=true;tokio::spawn(wait(tx.clone()));},Some(Action::Done)=>{s.loading=false;s.completed+=1;}},_=tick.tick(),if s.loading=>s.spinner=(s.spinner+1)%6}
+        tokio::select! {a=rx.recv()=>match a{Some(Action::Quit)|None=>break,Some(Action::Up)=>select(&mut s,-1),Some(Action::Down)=>select(&mut s,1),Some(Action::Left)=>{if has_child(&s){s.expanded.remove(&s.selected);}},Some(Action::Right)=>{if has_child(&s){s.expanded.insert(s.selected.clone());}},Some(Action::Open)=>activate(&mut s),Some(Action::Start)=>start(&mut s),Some(Action::Stop)=>request_stop(&mut s),Some(Action::Confirm)=>stop(&mut s),Some(Action::Cancel)=>{s.stop_confirmation=false;s.status.clear()},Some(Action::Refresh)=>refresh(&mut s),Some(Action::Wait)=>{s.loading=true;tokio::spawn(wait(tx.clone()));},Some(Action::Done)=>{s.loading=false;s.completed+=1;}},_=tick.tick(),if s.loading=>s.spinner=(s.spinner+1)%6}
     }
     Ok(())
 }
@@ -62,6 +72,79 @@ pub async fn run(
 async fn wait(tx: Sender<Action>) {
     time::sleep(Duration::from_secs(2)).await;
     let _ = tx.send(Action::Done).await;
+}
+
+fn refresh(state: &mut AppState) {
+    match crate::backend::discover_repositories(&state.home) {
+        Ok(repositories) => {
+            state.repositories = repositories;
+            state.sessions = state.session_backend.list().unwrap_or_default();
+            state.status = "Refreshed".into();
+        }
+        Err(error) => state.status = error.to_string(),
+    }
+}
+
+fn session_name(state: &AppState) -> Option<String> {
+    if project(&state.repositories, &state.selected).is_some() {
+        Some(crate::backend::sessions::session_name(&state.selected))
+    } else {
+        None
+    }
+}
+fn start(state: &mut AppState) {
+    if let Some(name) = session_name(state) {
+        match state.session_backend.create(&state.selected) {
+            Ok(_) => {
+                state.sessions = state.session_backend.list().unwrap_or_default();
+                state.status = format!("Started {name}");
+            }
+            Err(error) => state.status = error.to_string(),
+        }
+    }
+}
+fn activate(state: &mut AppState) {
+    if let Some(name) = session_name(state) {
+        let result = if state.sessions.iter().any(|session| session.name == name) {
+            state.session_backend.switch_to(&name)
+        } else {
+            state
+                .session_backend
+                .create(&state.selected)
+                .and_then(|_| state.session_backend.switch_to(&name))
+        };
+        match result {
+            Ok(()) => state.status = format!("Switched to {name}"),
+            Err(error) => state.status = error.to_string(),
+        }
+    }
+}
+fn request_stop(state: &mut AppState) {
+    if session_name(state)
+        .and_then(|name| {
+            state
+                .sessions
+                .iter()
+                .find(|session| session.name == name)
+                .map(|_| name)
+        })
+        .is_some()
+    {
+        state.stop_confirmation = true;
+        state.status = "Stop session? y/n".into();
+    }
+}
+fn stop(state: &mut AppState) {
+    if let Some(name) = session_name(state) {
+        match state.session_backend.stop(&name) {
+            Ok(()) => {
+                state.sessions = state.session_backend.list().unwrap_or_default();
+                state.status = format!("Stopped {name}");
+            }
+            Err(error) => state.status = error.to_string(),
+        }
+    }
+    state.stop_confirmation = false;
 }
 
 pub struct Row {
@@ -88,6 +171,9 @@ pub fn rows(home: &Path, repos: &[Repository], expanded: &HashSet<PathBuf>) -> V
     }
     set.into_iter()
         .filter_map(|p| {
+            if p == home {
+                return None;
+            }
             if p != home
                 && !p
                     .ancestors()
@@ -99,7 +185,8 @@ pub fn rows(home: &Path, repos: &[Repository], expanded: &HashSet<PathBuf>) -> V
             let depth = p
                 .strip_prefix(home)
                 .map(|x| x.components().count())
-                .unwrap_or(0);
+                .unwrap_or(1)
+                .saturating_sub(1);
             Some(Row {
                 path: p.clone(),
                 depth,

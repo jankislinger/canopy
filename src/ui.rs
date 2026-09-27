@@ -33,8 +33,20 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
                 .file_name()
                 .unwrap_or(r.path.as_os_str())
                 .to_string_lossy();
+            let session_status = r
+                .kinds
+                .as_ref()
+                .map(|_| {
+                    let name = crate::backend::sessions::session_name(&r.path);
+                    match s.sessions.iter().find(|session| session.name == name) {
+                        Some(session) if session.attached_clients > 0 => "● attached",
+                        Some(_) => "● running",
+                        None => "○ stopped",
+                    }
+                })
+                .unwrap_or("");
             let text = format!(
-                "{}{:indent$}{m} {} {}",
+                "{}{:indent$}{m} {} {} {session_status}",
                 if r.path == s.selected { "›" } else { " " },
                 "",
                 k.map(|x| format!("[{x}]")).unwrap_or_default(),
@@ -60,8 +72,13 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
     f.render_widget(
         Paragraph::new(vec![
             Line::from(s.selected.display().to_string()),
-            Line::from("Enter: open in nvim"),
+            Line::from("Enter: switch  s: start  x: stop"),
             Line::from("r: refresh  q: quit"),
+            Line::from(if s.stop_confirmation {
+                "Confirm stop: y/n"
+            } else {
+                &s.status
+            }),
         ])
         .block(Block::bordered().title("Details")),
         p[1],

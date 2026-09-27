@@ -631,6 +631,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "ratatui",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
