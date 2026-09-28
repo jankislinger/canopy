@@ -25,7 +25,7 @@ impl Action {
     /// use learning_tui::action::Action;
     ///
     /// assert!(matches!(Action::from_key(KeyCode::Char('q')), Some(Action::Quit)));
-    /// assert!(Action::from_key(KeyCode::Char('x')).is_none());
+    /// assert!(Action::from_key(KeyCode::Char('z')).is_none());
     /// ```
     pub fn from_key(code: KeyCode) -> Option<Self> {
         Some(match code {
