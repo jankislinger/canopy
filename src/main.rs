@@ -11,7 +11,11 @@ use tokio::sync::mpsc;
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let home = backend::home_dir()?;
-    let repositories = backend::discover_repositories(&home)?;
+    let repositories = tokio::task::spawn_blocking({
+        let home = home.clone();
+        move || backend::discover_repositories(&home)
+    })
+    .await??;
     let mut terminal = ratatui::try_init()?;
     let (tx, mut rx) = mpsc::channel(8);
     let listener = tokio::task::spawn_blocking({

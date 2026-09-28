@@ -63,7 +63,7 @@ pub async fn run(
     let mut tick = time::interval(Duration::from_millis(150));
     loop {
         t.draw(|f| ui::draw(f, &s))?;
-        tokio::select! {a=rx.recv()=>match a{Some(Action::Quit)|None=>break,Some(Action::Up)=>select(&mut s,-1),Some(Action::Down)=>select(&mut s,1),Some(Action::Left)=>{if has_child(&s){s.expanded.remove(&s.selected);}},Some(Action::Right)=>{if has_child(&s){s.expanded.insert(s.selected.clone());}},Some(Action::Open)=>activate(&mut s),Some(Action::Start)=>start(&mut s),Some(Action::Stop)=>request_stop(&mut s),Some(Action::Confirm)=>stop(&mut s),Some(Action::Cancel)=>{s.stop_confirmation=false;s.status.clear()},Some(Action::Refresh)=>refresh(&mut s),Some(Action::Wait)=>{s.loading=true;tokio::spawn(wait(tx.clone()));},Some(Action::Done)=>{s.loading=false;s.completed+=1;}},_=tick.tick(),if s.loading=>s.spinner=(s.spinner+1)%6}
+        tokio::select! {a=rx.recv()=>match a{Some(Action::Quit)|None=>break,Some(Action::Up)=>select(&mut s,-1),Some(Action::Down)=>select(&mut s,1),Some(Action::Left)=>{if has_child(&s){s.expanded.remove(&s.selected);}},Some(Action::Right)=>{if has_child(&s){s.expanded.insert(s.selected.clone());}},Some(Action::Open)=>activate(&mut s),Some(Action::Start)=>start(&mut s),Some(Action::Stop)=>request_stop(&mut s),Some(Action::Confirm)=>stop(&mut s),Some(Action::Cancel)=>{s.stop_confirmation=false;s.status.clear()},Some(Action::Refresh)=>{let home=s.home.clone();let result_tx=tx.clone();tokio::spawn(async move{let result=tokio::task::spawn_blocking(move||crate::backend::discover_repositories(&home)).await.map_err(|error|error.to_string()).and_then(|result|result.map_err(|error|error.to_string()));let _=result_tx.send(Action::ProjectsLoaded(result)).await;});s.status="Scanning projects...".into()},Some(Action::ProjectsLoaded(Ok(repositories)))=>{s.repositories=repositories;s.expanded=all_dirs(&s.home,&s.repositories);let visible=rows(&s.home,&s.repositories,&s.expanded);if !visible.iter().any(|row|row.path==s.selected){s.selected=visible.first().map(|row|row.path.clone()).unwrap_or_else(||s.home.clone())}s.status="Projects refreshed".into()},Some(Action::ProjectsLoaded(Err(error)))=>s.status=format!("Project scan failed: {error}"),Some(Action::Wait)=>{s.loading=true;tokio::spawn(wait(tx.clone()));},Some(Action::Done)=>{s.loading=false;s.completed+=1;}},_=tick.tick(),if s.loading=>s.spinner=(s.spinner+1)%6}
     }
     Ok(())
 }
@@ -74,13 +74,9 @@ async fn wait(tx: Sender<Action>) {
     let _ = tx.send(Action::Done).await;
 }
 
-fn refresh(state: &mut AppState) {
-    match crate::backend::discover_repositories(&state.home) {
-        Ok(repositories) => {
-            state.repositories = repositories;
-            state.sessions = state.session_backend.list().unwrap_or_default();
-            state.status = "Refreshed".into();
-        }
+fn refresh_sessions(state: &mut AppState) {
+    match state.session_backend.list() {
+        Ok(sessions) => state.sessions = sessions,
         Err(error) => state.status = error.to_string(),
     }
 }
@@ -96,7 +92,7 @@ fn start(state: &mut AppState) {
     if let Some(name) = session_name(state) {
         match state.session_backend.create(&state.selected) {
             Ok(_) => {
-                state.sessions = state.session_backend.list().unwrap_or_default();
+                refresh_sessions(state);
                 state.status = format!("Started {name}");
             }
             Err(error) => state.status = error.to_string(),
@@ -117,6 +113,7 @@ fn activate(state: &mut AppState) {
             Ok(()) => state.status = format!("Switched to {name}"),
             Err(error) => state.status = error.to_string(),
         }
+        refresh_sessions(state);
     }
 }
 fn request_stop(state: &mut AppState) {
@@ -138,7 +135,7 @@ fn stop(state: &mut AppState) {
     if let Some(name) = session_name(state) {
         match state.session_backend.stop(&name) {
             Ok(()) => {
-                state.sessions = state.session_backend.list().unwrap_or_default();
+                refresh_sessions(state);
                 state.status = format!("Stopped {name}");
             }
             Err(error) => state.status = error.to_string(),

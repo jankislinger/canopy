@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, Paragraph},
+    widgets::{Block, Clear, List, ListItem, Paragraph},
 };
 /// Renders the project tree, details pane, and experiments panel.
 pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
@@ -87,4 +87,36 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
         Paragraph::new("Hello, world!").block(Block::bordered().title("Experiments")),
         a[1],
     );
+    if s.stop_confirmation {
+        let popup = centered_rect(60, 7, f.area());
+        f.render_widget(Clear, popup);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from("Stop the selected tmux session?"),
+                Line::from(s.selected.display().to_string()),
+                Line::from("[y] confirm    [n/Esc] cancel"),
+            ])
+            .block(Block::bordered().title("Confirm stop")),
+            popup,
+        );
+    }
+}
+
+fn centered_rect(
+    width_percent: u16,
+    height: u16,
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let vertical = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Percentage(width_percent),
+        Constraint::Fill(1),
+    ])
+    .split(vertical[1])[1]
 }

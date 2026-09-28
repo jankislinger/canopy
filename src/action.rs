@@ -15,6 +15,7 @@ pub enum Action {
     Stop,
     Confirm,
     Cancel,
+    ProjectsLoaded(Result<Vec<crate::backend::Repository>, String>),
 }
 
 impl Action {
