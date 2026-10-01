@@ -1,4 +1,5 @@
 use crate::app::{AppState, kind, rows};
+use ansi_to_tui::IntoText;
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
@@ -80,11 +81,26 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
     if let Some(popup) = &s.command_popup {
         let area = centered_rect(85, 20, f.area());
         f.render_widget(Clear, area);
+        let border_color = match popup.success {
+            Some(true) => Color::Green,
+            Some(false) => Color::Red,
+            None => Color::Yellow,
+        };
         f.render_widget(
-            Paragraph::new(popup.output.as_str())
-                .block(Block::bordered().title(popup.title.as_str()))
-                .scroll((popup.scroll, 0))
-                .wrap(ratatui::widgets::Wrap { trim: false }),
+            Paragraph::new(
+                popup
+                    .output
+                    .as_bytes()
+                    .into_text()
+                    .unwrap_or_else(|_| popup.output.as_str().into()),
+            )
+            .block(
+                Block::bordered()
+                    .title(popup.title.as_str())
+                    .border_style(Style::default().fg(border_color)),
+            )
+            .scroll((popup.scroll, 0))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
             area,
         );
     }

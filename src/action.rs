@@ -18,7 +18,8 @@ pub enum Action {
     Resize,
     Test,
     Lint,
-    CommandFinished { generation: u64, title: String, output: String },
+    CommandOutput { generation: u64, output: String },
+    CommandFinished { generation: u64, title: String, output: String, success: bool },
     ProjectsLoaded { generation: u64, result: Result<Vec<crate::backend::Repository>, String> },
 }
 

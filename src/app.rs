@@ -4,11 +4,12 @@ use crate::{
     backend::{Project, ProjectKind, Repository},
     ui,
 };
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::DefaultTerminal;
 use std::{
     collections::{BTreeSet, HashSet},
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
 };
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -23,6 +24,8 @@ pub struct CommandPopup {
     pub title: String,
     pub output: String,
     pub scroll: u16,
+    pub follow: bool,
+    pub success: Option<bool>,
 }
 
 pub struct AppState {
@@ -118,8 +121,21 @@ pub async fn run(
                 Some(Action::Resize) => {}
                 Some(Action::Test) => run_command(&mut s, false, tx.clone()),
                 Some(Action::Lint) => run_command(&mut s, true, tx.clone()),
-                Some(Action::CommandFinished { generation, title, output }) if generation == s.command_generation => {
-                    s.command_popup = Some(CommandPopup { title, output, scroll: 0 });
+                Some(Action::CommandFinished { generation, title, output, success }) if generation == s.command_generation => {
+                    if let Some(popup) = s.command_popup.as_mut() {
+                        popup.title = title;
+                        popup.output = output;
+                        popup.success = Some(success);
+                        if popup.follow { popup.scroll = bottom_scroll(&popup.output); }
+                    } else {
+                        s.command_popup = Some(CommandPopup { title, output, scroll: 0, follow: true, success: Some(success) });
+                    }
+                }
+                Some(Action::CommandOutput { generation, output }) if generation == s.command_generation => {
+                    if let Some(popup) = s.command_popup.as_mut() {
+                        popup.output.push_str(&output);
+                        if popup.follow { popup.scroll = bottom_scroll(&popup.output); }
+                    }
                 }
                 Some(Action::CommandFinished { .. }) => {}
                 Some(Action::Refresh) => {
@@ -162,6 +178,7 @@ pub async fn run(
                 Some(Action::ProjectsLoaded { .. }) => {}
                 Some(Action::Wait) => { s.loading = true; tokio::spawn(wait(tx.clone())); }
                 Some(Action::Done) => { s.loading = false; s.completed += 1; }
+                Some(Action::CommandOutput { .. }) => {}
             },
             _ = tick.tick(), if s.loading => s.spinner = (s.spinner + 1) % 6,
         }
@@ -248,13 +265,28 @@ fn run_command(state: &mut AppState, lint: bool, tx: Sender<Action>) {
     let title = if lint { "Lint" } else { "Test" }.to_string();
     state.command_generation += 1;
     let generation = state.command_generation;
-    state.command_popup =
-        Some(CommandPopup { title: title.clone(), output: "Running...".into(), scroll: 0 });
+    state.command_popup = Some(CommandPopup {
+        title: title.clone(),
+        output: "Running...\n".into(),
+        scroll: 0,
+        follow: true,
+        success: None,
+    });
+    let output_tx = tx.clone();
     tokio::spawn(async move {
-        let output = tokio::task::spawn_blocking(move || execute_commands(&path, &kinds, lint))
-            .await
-            .unwrap_or_else(|error| format!("Command task failed: {error}"));
-        let _ = tx.send(Action::CommandFinished { generation, title, output }).await;
+        let result = tokio::task::spawn_blocking(move || {
+            execute_commands_streaming(&path, &kinds, lint, generation, output_tx)
+        })
+        .await
+        .unwrap_or_else(|error| (format!("Command task failed: {error}"), false));
+        let _ = tx
+            .send(Action::CommandFinished {
+                generation,
+                title,
+                output: result.0,
+                success: result.1,
+            })
+            .await;
     });
 }
 
@@ -262,13 +294,26 @@ fn scroll_popup(state: &mut AppState, delta: i16) {
     if let Some(popup) = state.command_popup.as_mut() {
         if delta.is_negative() {
             popup.scroll = popup.scroll.saturating_sub(delta.unsigned_abs());
+            popup.follow = false;
         } else {
-            popup.scroll = popup.scroll.saturating_add(delta as u16);
+            let bottom = bottom_scroll(&popup.output);
+            popup.scroll = popup.scroll.saturating_add(delta as u16).min(bottom);
+            popup.follow = popup.scroll == bottom;
         }
     }
 }
 
-fn execute_commands(path: &Path, kinds: &[ProjectKind], lint: bool) -> String {
+fn bottom_scroll(output: &str) -> u16 {
+    output.lines().count().saturating_sub(18).min(u16::MAX as usize) as u16
+}
+
+fn execute_commands_streaming(
+    path: &Path,
+    kinds: &[ProjectKind],
+    lint: bool,
+    generation: u64,
+    tx: Sender<Action>,
+) -> (String, bool) {
     let mut commands = Vec::new();
     if kinds.contains(&ProjectKind::Python) {
         commands.push(if lint {
@@ -289,21 +334,60 @@ fn execute_commands(path: &Path, kinds: &[ProjectKind], lint: bool) -> String {
         }
     }
     if commands.is_empty() {
-        return "No test or lint command is defined for this project.".into();
+        return ("No test or lint command is defined for this project.".into(), false);
     }
     let mut output = String::new();
+    let mut success = true;
     for command in commands {
-        output.push_str(&format!("$ {}\n", command.join(" ")));
-        match Command::new(command[0]).args(&command[1..]).current_dir(path).output() {
-            Ok(result) => {
-                output.push_str(&String::from_utf8_lossy(&result.stdout));
-                output.push_str(&String::from_utf8_lossy(&result.stderr));
-                output.push_str(&format!("\n[exit status: {}]\n\n", result.status));
+        let header = format!("$ {}\n", command.join(" "));
+        output.push_str(&header);
+        let _ = tx.blocking_send(Action::CommandOutput { generation, output: header });
+        match execute_command_in_pty(path, &command, generation, &tx) {
+            Ok((command_output, command_success)) => {
+                output.push_str(&command_output);
+                success &= command_success;
             }
-            Err(error) => output.push_str(&format!("failed to start command: {error}\n\n")),
+            Err(error) => {
+                let text = format!("failed to start command: {error}\n\n");
+                output.push_str(&text);
+                success = false;
+                let _ = tx.blocking_send(Action::CommandOutput { generation, output: text });
+            }
         }
     }
-    output
+    (output, success)
+}
+
+fn execute_command_in_pty(
+    path: &Path,
+    command: &[&str],
+    generation: u64,
+    tx: &Sender<Action>,
+) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
+    let pty_system = native_pty_system();
+    let pair =
+        pty_system.openpty(PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 })?;
+    let mut builder = CommandBuilder::new(command[0]);
+    builder.args(&command[1..]);
+    builder.cwd(path);
+    let mut child = pair.slave.spawn_command(builder)?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader()?;
+    let mut command_output = String::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
+        command_output.push_str(&chunk);
+        let _ = tx.blocking_send(Action::CommandOutput { generation, output: chunk });
+    }
+
+    let status = child.wait()?;
+    Ok((command_output, status.success()))
 }
 
 pub struct Row {
