@@ -15,7 +15,11 @@ pub enum Action {
     Stop,
     Confirm,
     Cancel,
-    ProjectsLoaded(Result<Vec<crate::backend::Repository>, String>),
+    Resize,
+    Test,
+    Lint,
+    CommandFinished { generation: u64, title: String, output: String },
+    ProjectsLoaded { generation: u64, result: Result<Vec<crate::backend::Repository>, String> },
 }
 
 impl Action {
@@ -42,6 +46,8 @@ impl Action {
             KeyCode::Char('x') => Self::Stop,
             KeyCode::Char('y') => Self::Confirm,
             KeyCode::Char('n') | KeyCode::Esc => Self::Cancel,
+            KeyCode::Char('t') => Self::Test,
+            KeyCode::Char('l') => Self::Lint,
             _ => return None,
         })
     }

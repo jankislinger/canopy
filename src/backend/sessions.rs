@@ -39,9 +39,7 @@ impl Default for SessionBackend {
 impl SessionBackend {
     /// Creates a backend using the supplied tmux executable.
     pub fn new(executable: impl Into<PathBuf>) -> Self {
-        Self {
-            executable: executable.into(),
-        }
+        Self { executable: executable.into() }
     }
 
     /// Lists sessions currently known to the tmux server.
@@ -59,10 +57,7 @@ impl SessionBackend {
     /// The first tmux window runs `nvim`; the second is an empty shell window.
     pub fn create(&self, project_path: &Path) -> Result<String, SessionError> {
         let path = project_path.canonicalize().map_err(|error| {
-            SessionError::Command(format!(
-                "cannot resolve {}: {error}",
-                project_path.display()
-            ))
+            SessionError::Command(format!("cannot resolve {}: {error}", project_path.display()))
         })?;
         let name = session_name(&path);
         self.command_owned(vec![
@@ -113,12 +108,8 @@ impl SessionBackend {
 
     /// Stops and removes a tmux session.
     pub fn stop(&self, session_name: &str) -> Result<(), SessionError> {
-        self.command_owned(vec![
-            "kill-session".into(),
-            "-t".into(),
-            session_name.into(),
-        ])
-        .map(|_| ())
+        self.command_owned(vec!["kill-session".into(), "-t".into(), session_name.into()])
+            .map(|_| ())
     }
 
     fn command<'a, I>(&self, args: I) -> Result<String, SessionError>
@@ -146,25 +137,16 @@ impl SessionBackend {
 /// A repository root is named after its directory. A project below a Git
 /// repository is named `repository/project`.
 pub fn session_name(path: &Path) -> String {
-    let project_name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy();
+    let project_name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
     let mut current = Some(path);
     while let Some(directory) = current {
         if directory.join(".git").is_dir() {
-            let repository_name = directory
-                .file_name()
-                .unwrap_or(directory.as_os_str())
-                .to_string_lossy();
+            let repository_name =
+                directory.file_name().unwrap_or(directory.as_os_str()).to_string_lossy();
             return if directory == path {
                 sanitize_name(&repository_name)
             } else {
-                format!(
-                    "{}/{}",
-                    sanitize_name(&repository_name),
-                    sanitize_name(&project_name)
-                )
+                format!("{}/{}", sanitize_name(&repository_name), sanitize_name(&project_name))
             };
         }
         current = directory.parent();
@@ -190,9 +172,7 @@ fn parse_session_listing(listing: &str) -> Result<Vec<Session>, SessionError> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let mut fields = line.splitn(3, '\t');
-            let name = fields
-                .next()
-                .ok_or_else(|| SessionError::InvalidListing(line.into()))?;
+            let name = fields.next().ok_or_else(|| SessionError::InvalidListing(line.into()))?;
             let attached = fields
                 .next()
                 .and_then(|value| value.parse().ok())
@@ -246,9 +226,6 @@ mod tests {
     }
     #[test]
     fn rejects_malformed_session_listing() {
-        assert!(matches!(
-            parse_session_listing("broken"),
-            Err(SessionError::InvalidListing(_))
-        ));
+        assert!(matches!(parse_session_listing("broken"), Err(SessionError::InvalidListing(_))));
     }
 }

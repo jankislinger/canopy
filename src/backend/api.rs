@@ -19,20 +19,12 @@ pub struct Repository {
     pub path: PathBuf,
     pub projects: Vec<Project>,
 }
-const SKIPPED_DIRS: [&str; 6] = [
-    "target",
-    "node_modules",
-    ".venv",
-    "__pycache__",
-    ".cache",
-    "build",
-];
+const SKIPPED_DIRS: [&str; 6] =
+    ["target", "node_modules", ".venv", "__pycache__", ".cache", "build"];
 
 /// Returns the current user's home directory from the `HOME` environment variable.
 pub fn home_dir() -> color_eyre::Result<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| color_eyre::eyre::eyre!("HOME is not set"))
+    env::var_os("HOME").map(PathBuf::from).ok_or_else(|| color_eyre::eyre::eyre!("HOME is not set"))
 }
 
 /// Discovers Git repositories and their direct child Python/Rust projects below `root`.
@@ -77,10 +69,7 @@ fn make_repository(path: PathBuf) -> Repository {
     if path.join("Cargo.toml").is_file() {
         root_kinds.push(ProjectKind::Rust)
     }
-    let mut projects = vec![Project {
-        path: path.clone(),
-        kinds: root_kinds,
-    }];
+    let mut projects = vec![Project { path: path.clone(), kinds: root_kinds }];
     if let Ok(entries) = fs::read_dir(&path) {
         for entry in entries.flatten() {
             let child = entry.path();
@@ -112,10 +101,7 @@ mod tests {
         fn new() -> Self {
             let p = env::temp_dir().join(format!(
                 "learning-tui-test-{}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
             ));
             fs::create_dir_all(&p).unwrap();
             Self(p)
@@ -138,10 +124,7 @@ mod tests {
         let repos = discover_repositories(&t.0).unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].projects.len(), 2);
-        assert_eq!(
-            repos[0].projects[0].kinds,
-            vec![ProjectKind::Git, ProjectKind::Rust]
-        );
+        assert_eq!(repos[0].projects[0].kinds, vec![ProjectKind::Git, ProjectKind::Rust]);
         assert_eq!(repos[0].projects[1].kinds, vec![ProjectKind::Python]);
     }
 }
