@@ -1,6 +1,6 @@
-# learning-tui
+# Canopy
 
-`learning-tui` is a terminal project manager built with Rust and Ratatui. It is intended to grow into a terminal-native alternative to opening many projects in separate IDE windows.
+`canopy` is a terminal project manager built with Rust and Ratatui. It is intended to grow into a terminal-native alternative to opening many projects in separate IDE windows.
 
 ## Current functionality
 

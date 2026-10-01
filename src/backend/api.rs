@@ -100,7 +100,7 @@ mod tests {
     impl Temp {
         fn new() -> Self {
             let p = env::temp_dir().join(format!(
-                "learning-tui-test-{}",
+                "canopy-test-{}",
                 SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
             ));
             fs::create_dir_all(&p).unwrap();

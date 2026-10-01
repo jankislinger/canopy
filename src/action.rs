@@ -27,7 +27,7 @@ impl Action {
     ///
     /// ```
     /// use crossterm::event::KeyCode;
-    /// use learning_tui::action::Action;
+    /// use canopy::action::Action;
     ///
     /// assert!(matches!(Action::from_key(KeyCode::Char('q')), Some(Action::Quit)));
     /// assert!(Action::from_key(KeyCode::Char('z')).is_none());

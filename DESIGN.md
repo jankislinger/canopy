@@ -43,7 +43,7 @@ Each detected project should eventually have:
 Use the canonical path to derive a stable, collision-resistant session name, for example:
 
 ```text
-learning-tui--home-jan-project
+canopy--home-jan-project
 ```
 
 Git worktrees should remain a future hierarchy layer between a repository and its coding projects. They are not part of the first session implementation.

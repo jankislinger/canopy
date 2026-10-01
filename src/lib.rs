@@ -1,4 +1,4 @@
-//! Reusable application components for `learning-tui`.
+//! Reusable application components for `canopy`.
 
 pub mod action;
 pub mod backend;
