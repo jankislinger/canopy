@@ -1,13 +1,13 @@
 use crate::{
     action::Action,
     backend::sessions::{Session, SessionBackend},
-    backend::{Project, ProjectKind, Repository},
+    backend::{Project, ProjectKind, Repository, git::GitStatus},
     ui,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::DefaultTerminal;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -43,6 +43,10 @@ pub struct AppState {
     pub project_scan_generation: u64,
     pub command_popup: Option<CommandPopup>,
     pub command_generation: u64,
+    pub git_status: Option<GitStatus>,
+    pub git_status_cache: HashMap<PathBuf, GitStatus>,
+    pub git_status_loading: bool,
+    pub git_status_generation: u64,
 }
 impl AppState {
     /// Creates application state with the discovered tree expanded.
@@ -71,6 +75,10 @@ impl AppState {
             project_scan_generation: 0,
             command_popup: None,
             command_generation: 0,
+            git_status: None,
+            git_status_cache: HashMap::new(),
+            git_status_loading: false,
+            git_status_generation: 0,
         }
     }
 }
@@ -81,6 +89,7 @@ pub async fn run(
     tx: Sender<Action>,
     mut s: AppState,
 ) -> color_eyre::Result<()> {
+    request_git_status(&mut s, tx.clone());
     let mut tick = time::interval(Duration::from_millis(150));
     loop {
         t.draw(|f| ui::draw(f, &s))?;
@@ -93,8 +102,14 @@ pub async fn run(
                 }
                 Some(Action::Up) if s.command_popup.is_some() => scroll_popup(&mut s, -1),
                 Some(Action::Down) if s.command_popup.is_some() => scroll_popup(&mut s, 1),
-                Some(Action::Up) => select(&mut s, -1),
-                Some(Action::Down) => select(&mut s, 1),
+                Some(Action::Up) => {
+                    select(&mut s, -1);
+                    request_git_status(&mut s, tx.clone());
+                }
+                Some(Action::Down) => {
+                    select(&mut s, 1);
+                    request_git_status(&mut s, tx.clone());
+                }
                 Some(Action::Left) => {
                     if s.command_popup.is_none() && has_child(&s) {
                         s.expanded.remove(&s.selected);
@@ -138,6 +153,14 @@ pub async fn run(
                     }
                 }
                 Some(Action::CommandFinished { .. }) => {}
+                Some(Action::GitStatusLoaded { generation, path, result }) if generation == s.git_status_generation && path == s.selected => {
+                    s.git_status_loading = false;
+                    if let Ok(status) = result {
+                        s.git_status_cache.insert(path, status.clone());
+                        s.git_status = Some(status);
+                    }
+                }
+                Some(Action::GitStatusLoaded { .. }) => {}
                 Some(Action::Refresh) => {
                     s.project_scan_generation += 1;
                     let generation = s.project_scan_generation;
@@ -170,6 +193,7 @@ pub async fn run(
                             .map(|row| row.path.clone())
                             .unwrap_or_else(|| s.home.clone());
                     }
+                    request_git_status(&mut s, tx.clone());
                     s.status = "Projects refreshed".into();
                 }
                 Some(Action::ProjectsLoaded { generation, result: Err(error) }) if generation == s.project_scan_generation => {
@@ -197,6 +221,29 @@ fn refresh_sessions(state: &mut AppState) {
         Ok(sessions) => state.sessions = sessions,
         Err(error) => state.status = error.to_string(),
     }
+}
+
+fn request_git_status(state: &mut AppState, tx: Sender<Action>) {
+    state.git_status_generation += 1;
+    let generation = state.git_status_generation;
+    let path = state.selected.clone();
+    if project(&state.repositories, &path).is_none() {
+        state.git_status = None;
+        state.git_status_loading = false;
+        return;
+    }
+    let cached = state.git_status_cache.get(&path).cloned();
+    state.git_status = cached.clone();
+    state.git_status_loading = cached.is_none();
+    let load_path = path.clone();
+    tokio::spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || crate::backend::git::load_status(&load_path))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+        let _ = tx.send(Action::GitStatusLoaded { generation, path, result }).await;
+    });
 }
 
 fn session_name(state: &AppState) -> Option<String> {

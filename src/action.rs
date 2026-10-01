@@ -18,9 +18,25 @@ pub enum Action {
     Resize,
     Test,
     Lint,
-    CommandOutput { generation: u64, output: String },
-    CommandFinished { generation: u64, title: String, output: String, success: bool },
-    ProjectsLoaded { generation: u64, result: Result<Vec<crate::backend::Repository>, String> },
+    CommandOutput {
+        generation: u64,
+        output: String,
+    },
+    CommandFinished {
+        generation: u64,
+        title: String,
+        output: String,
+        success: bool,
+    },
+    GitStatusLoaded {
+        generation: u64,
+        path: std::path::PathBuf,
+        result: Result<crate::backend::git::GitStatus, String>,
+    },
+    ProjectsLoaded {
+        generation: u64,
+        result: Result<Vec<crate::backend::Repository>, String>,
+    },
 }
 
 impl Action {

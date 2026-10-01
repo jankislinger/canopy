@@ -51,10 +51,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
         })
         .collect::<Vec<_>>();
     f.render_widget(List::new(items).block(Block::bordered().title("Projects")), p[0]);
-    f.render_widget(
-        Paragraph::new(s.selected.display().to_string()).block(Block::bordered().title("Details")),
-        p[1],
-    );
+    f.render_widget(details(s), p[1]);
     f.render_widget(
         Paragraph::new(vec![
             Line::from("Enter: switch  s: start  x: stop"),
@@ -106,6 +103,49 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
     }
 }
 
+fn details(s: &AppState) -> Paragraph<'_> {
+    let mut lines = vec![Line::from(s.selected.display().to_string())];
+    if s.git_status_loading {
+        lines.push(Line::from("Loading Git history..."));
+    } else if let Some(status) = &s.git_status {
+        let (indicator, description, color) = match status.working_tree {
+            crate::backend::git::WorkingTree::Clean => ("✓", "clean", Color::Green),
+            crate::backend::git::WorkingTree::ChangesOutsideProject => {
+                ("●", "changes outside", Color::Yellow)
+            }
+            crate::backend::git::WorkingTree::ChangesInProject => {
+                ("●", "changes in project", Color::Red)
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::raw("branch: "),
+            Span::styled(&status.branch, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(format!("{indicator} {description}"), Style::default().fg(color)),
+        ]));
+        lines.push(Line::from(""));
+        for commit in &status.commits {
+            let foreground =
+                if commit.authored_by_user { Color::Cyan } else { Color::Rgb(110, 135, 180) };
+            let text_style = if commit.authored_by_user {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(&commit.sha, Style::default().fg(foreground)),
+                Span::styled(
+                    format!("  {:<3}  {:<14} {}", commit.author, commit.age, commit.message),
+                    text_style,
+                ),
+            ]));
+        }
+    } else {
+        lines.push(Line::from("Not in a Git repository"));
+    }
+    Paragraph::new(lines).block(Block::bordered().title("Details"))
+}
+
 fn centered_rect(
     width_percent: u16,
     height: u16,
@@ -120,4 +160,71 @@ fn centered_rect(
         Constraint::Fill(1),
     ])
     .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::details;
+    use crate::{
+        app::AppState,
+        backend::{
+            git::{GitCommit, GitStatus, WorkingTree},
+            sessions::SessionBackend,
+        },
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::{collections::HashSet, path::PathBuf};
+
+    #[test]
+    fn details_renders_six_characters_for_every_commit_sha() {
+        let state = AppState {
+            repositories: Vec::new(),
+            home: PathBuf::from("/home/test"),
+            selected: PathBuf::from("/home/test/repo"),
+            expanded: HashSet::new(),
+            loading: false,
+            completed: 0,
+            spinner: 0,
+            status: String::new(),
+            sessions: Vec::new(),
+            session_backend: SessionBackend::default(),
+            confirmation: None,
+            project_scan_generation: 0,
+            command_popup: None,
+            command_generation: 0,
+            git_status: Some(GitStatus {
+                repository: PathBuf::from("/home/test/repo"),
+                branch: "main".into(),
+                working_tree: WorkingTree::Clean,
+                commits: vec![
+                    GitCommit {
+                        sha: "123456".into(),
+                        author: "AL".into(),
+                        authored_by_user: true,
+                        message: "latest".into(),
+                        age: "1 hour ago".into(),
+                    },
+                    GitCommit {
+                        sha: "abcdef".into(),
+                        author: "GH".into(),
+                        authored_by_user: false,
+                        message: "older".into(),
+                        age: "2 hours ago".into(),
+                    },
+                ],
+            }),
+            git_status_cache: Default::default(),
+            git_status_loading: false,
+            git_status_generation: 0,
+        };
+        let backend = TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| frame.render_widget(details(&state), frame.area())).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        for (y, expected) in [(4, "123456"), (5, "abcdef")] {
+            let rendered: String = (1..7).map(|x| buffer[(x, y)].symbol()).collect();
+            assert_eq!(rendered, expected);
+        }
+    }
 }
