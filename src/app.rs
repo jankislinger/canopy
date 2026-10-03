@@ -94,120 +94,158 @@ pub async fn run(
     loop {
         t.draw(|f| ui::draw(f, &s))?;
         tokio::select! {
-            action = rx.recv() => match action {
-                Some(Action::Quit) if s.command_popup.is_none() => break,
-                Some(Action::Quit) => { s.command_popup = None; s.command_generation += 1; }
-                None => {
-                    if s.command_popup.is_none() { break; }
-                }
-                Some(Action::Up) if s.command_popup.is_some() => scroll_popup(&mut s, -1),
-                Some(Action::Down) if s.command_popup.is_some() => scroll_popup(&mut s, 1),
-                Some(Action::Up) => {
-                    select(&mut s, -1);
-                    request_git_status(&mut s, tx.clone());
-                }
-                Some(Action::Down) => {
-                    select(&mut s, 1);
-                    request_git_status(&mut s, tx.clone());
-                }
-                Some(Action::Left) => {
-                    if s.command_popup.is_none() && has_child(&s) {
-                        s.expanded.remove(&s.selected);
+            action = rx.recv() => match (s.command_popup.as_ref(), action) {
+                (None, Some(action)) => match action {
+                    Action::Quit => break,
+                    Action::Up => {
+                        select(&mut s, -1);
+                        request_git_status(&mut s, tx.clone());
                     }
-                }
-                Some(Action::Right) => {
-                    if s.command_popup.is_none() && has_child(&s) {
-                        s.expanded.insert(s.selected.clone());
+                    Action::Down => {
+                        select(&mut s, 1);
+                        request_git_status(&mut s, tx.clone());
                     }
-                }
-                Some(Action::Open) => activate(&mut s),
-                Some(Action::Start) => start(&mut s),
-                Some(Action::Stop) => request_stop(&mut s),
-                Some(Action::Confirm) => match s.confirmation.take() {
-                    Some(Confirmation::StopSession) => stop(&mut s),
-                    None => {}
-                }
-                Some(Action::Cancel) => {
-                    s.confirmation = None;
-                    s.command_popup = None;
-                    s.command_generation += 1;
-                    s.status.clear();
-                }
-                Some(Action::Resize) => {}
-                Some(Action::Test) => run_command(&mut s, false, tx.clone()),
-                Some(Action::Lint) => run_command(&mut s, true, tx.clone()),
-                Some(Action::CommandFinished { generation, title, output, success }) if generation == s.command_generation => {
-                    if let Some(popup) = s.command_popup.as_mut() {
-                        popup.title = title;
-                        popup.output = output;
-                        popup.success = Some(success);
-                        if popup.follow { popup.scroll = bottom_scroll(&popup.output); }
-                    } else {
-                        s.command_popup = Some(CommandPopup { title, output, scroll: 0, follow: true, success: Some(success) });
+                    Action::Left => {
+                        if has_child(&s) { s.expanded.remove(&s.selected); }
                     }
-                }
-                Some(Action::CommandOutput { generation, output }) if generation == s.command_generation => {
-                    if let Some(popup) = s.command_popup.as_mut() {
-                        popup.output.push_str(&output);
-                        if popup.follow { popup.scroll = bottom_scroll(&popup.output); }
+                    Action::Right => {
+                        if has_child(&s) { s.expanded.insert(s.selected.clone()); }
                     }
-                }
-                Some(Action::CommandFinished { .. }) => {}
-                Some(Action::GitStatusLoaded { generation, path, result }) if generation == s.git_status_generation && path == s.selected => {
-                    s.git_status_loading = false;
-                    if let Ok(status) = result {
-                        s.git_status_cache.insert(path, status.clone());
-                        s.git_status = Some(status);
+                    Action::Open => activate(&mut s),
+                    Action::Start => start(&mut s),
+                    Action::Stop => request_stop(&mut s),
+                    Action::Confirm => match s.confirmation.take() {
+                        Some(Confirmation::StopSession) => stop(&mut s),
+                        None => {}
+                    },
+                    Action::Cancel => {
+                        s.confirmation = None;
+                        s.status.clear();
                     }
-                }
-                Some(Action::GitStatusLoaded { .. }) => {}
-                Some(Action::Refresh) => {
-                    s.project_scan_generation += 1;
-                    let generation = s.project_scan_generation;
-                    let home = s.home.clone();
-                    let result_tx = tx.clone();
-                    tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            crate::backend::discover_repositories(&home)
-                        })
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result.map_err(|error| error.to_string()));
-                        let _ = result_tx.send(Action::ProjectsLoaded { generation, result }).await;
-                    });
-                    s.status = "Scanning projects...".into();
-                }
-                Some(Action::ProjectsLoaded { generation, result: Ok(repositories) }) if generation == s.project_scan_generation => {
-                    let previously_expanded = s.expanded.clone();
-                    s.repositories = repositories;
-                    let available = all_dirs(&s.home, &s.repositories);
-                    s.expanded = previously_expanded
-                        .into_iter()
-                        .filter(|path| available.contains(path))
-                        .collect();
-                    s.expanded.insert(s.home.clone());
-                    let visible = rows(&s.home, &s.repositories, &s.expanded);
-                    if !visible.iter().any(|row| row.path == s.selected) {
-                        s.selected = visible
-                            .first()
-                            .map(|row| row.path.clone())
-                            .unwrap_or_else(|| s.home.clone());
+                    Action::Test => run_command(&mut s, false, tx.clone()),
+                    Action::Lint => run_command(&mut s, true, tx.clone()),
+                    Action::Refresh => refresh_projects(&mut s, tx.clone()),
+                    action => { let _ = handle_background_action(&mut s, action, tx.clone()); }
+                },
+                (Some(_), Some(action)) => match action {
+                    Action::Quit | Action::Cancel => {
+                        s.command_popup = None;
+                        s.command_generation += 1;
+                        s.confirmation = None;
+                        s.status.clear();
                     }
-                    request_git_status(&mut s, tx.clone());
-                    s.status = "Projects refreshed".into();
-                }
-                Some(Action::ProjectsLoaded { generation, result: Err(error) }) if generation == s.project_scan_generation => {
-                    s.status = format!("Project scan failed: {error}");
-                }
-                Some(Action::ProjectsLoaded { .. }) => {}
-                Some(Action::Wait) => { s.loading = true; tokio::spawn(wait(tx.clone())); }
-                Some(Action::Done) => { s.loading = false; s.completed += 1; }
-                Some(Action::CommandOutput { .. }) => {}
+                    Action::Up => scroll_popup(&mut s, -1),
+                    Action::Down => scroll_popup(&mut s, 1),
+                    action => { let _ = handle_background_action(&mut s, action, tx.clone()); }
+                },
+                (_, None) => break,
             },
             _ = tick.tick(), if s.loading => s.spinner = (s.spinner + 1) % 6,
         }
     }
     Ok(())
+}
+
+/// Handles asynchronous events that can arrive with or without an open popup.
+fn handle_background_action(
+    state: &mut AppState,
+    action: Action,
+    tx: Sender<Action>,
+) -> Result<(), Action> {
+    match action {
+        Action::Resize => {}
+        Action::CommandFinished { generation, title, output, success } => {
+            if generation == state.command_generation {
+                if let Some(popup) = state.command_popup.as_mut() {
+                    popup.title = title;
+                    popup.output = output;
+                    popup.success = Some(success);
+                    if popup.follow {
+                        popup.scroll = bottom_scroll(&popup.output);
+                    }
+                } else {
+                    state.command_popup = Some(CommandPopup {
+                        title,
+                        output,
+                        scroll: 0,
+                        follow: true,
+                        success: Some(success),
+                    });
+                }
+            }
+        }
+        Action::CommandOutput { generation, output } => {
+            if generation == state.command_generation
+                && let Some(popup) = state.command_popup.as_mut()
+            {
+                popup.output.push_str(&output);
+                if popup.follow {
+                    popup.scroll = bottom_scroll(&popup.output);
+                }
+            }
+        }
+        Action::GitStatusLoaded { generation, path, result } => {
+            if generation == state.git_status_generation && path == state.selected {
+                state.git_status_loading = false;
+                if let Ok(status) = result {
+                    state.git_status_cache.insert(path, status.clone());
+                    state.git_status = Some(status);
+                }
+            }
+        }
+        Action::ProjectsLoaded { generation, result } => {
+            if generation == state.project_scan_generation {
+                match result {
+                    Ok(repositories) => {
+                        let previously_expanded = state.expanded.clone();
+                        state.repositories = repositories;
+                        let available = all_dirs(&state.home, &state.repositories);
+                        state.expanded = previously_expanded
+                            .into_iter()
+                            .filter(|path| available.contains(path))
+                            .collect();
+                        state.expanded.insert(state.home.clone());
+                        let visible = rows(&state.home, &state.repositories, &state.expanded);
+                        if !visible.iter().any(|row| row.path == state.selected) {
+                            state.selected = visible
+                                .first()
+                                .map(|row| row.path.clone())
+                                .unwrap_or_else(|| state.home.clone());
+                        }
+                        request_git_status(state, tx.clone());
+                        state.status = "Projects refreshed".into();
+                    }
+                    Err(error) => state.status = format!("Project scan failed: {error}"),
+                }
+            }
+        }
+        Action::Wait => {
+            state.loading = true;
+            tokio::spawn(wait(tx));
+        }
+        Action::Done => {
+            state.loading = false;
+            state.completed += 1;
+        }
+        action => return Err(action),
+    }
+    Ok(())
+}
+
+/// Starts a background scan of the project tree.
+fn refresh_projects(state: &mut AppState, tx: Sender<Action>) {
+    state.project_scan_generation += 1;
+    let generation = state.project_scan_generation;
+    let home = state.home.clone();
+    tokio::spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || crate::backend::discover_repositories(&home))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+        let _ = tx.send(Action::ProjectsLoaded { generation, result }).await;
+    });
+    state.status = "Scanning projects...".into();
 }
 
 /// Sends a completion action after the demonstration delay.
