@@ -33,6 +33,10 @@ pub enum Action {
         path: std::path::PathBuf,
         result: Result<crate::backend::git::GitStatus, String>,
     },
+    SessionsLoaded {
+        generation: u64,
+        result: Result<Vec<crate::backend::sessions::Session>, String>,
+    },
     ProjectsLoaded {
         generation: u64,
         result: Result<Vec<crate::backend::Repository>, String>,

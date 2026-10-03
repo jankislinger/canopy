@@ -216,6 +216,8 @@ mod tests {
             git_status_cache: Default::default(),
             git_status_loading: false,
             git_status_generation: 0,
+            sessions_refresh_generation: 0,
+            sessions_refresh_pending: false,
         };
         let backend = TestBackend::new(100, 10);
         let mut terminal = Terminal::new(backend).unwrap();

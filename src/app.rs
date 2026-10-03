@@ -47,6 +47,8 @@ pub struct AppState {
     pub git_status_cache: HashMap<PathBuf, GitStatus>,
     pub git_status_loading: bool,
     pub git_status_generation: u64,
+    pub sessions_refresh_generation: u64,
+    pub sessions_refresh_pending: bool,
 }
 impl AppState {
     /// Creates application state with the discovered tree expanded.
@@ -79,6 +81,8 @@ impl AppState {
             git_status_cache: HashMap::new(),
             git_status_loading: false,
             git_status_generation: 0,
+            sessions_refresh_generation: 0,
+            sessions_refresh_pending: false,
         }
     }
 }
@@ -91,6 +95,9 @@ pub async fn run(
 ) -> color_eyre::Result<()> {
     request_git_status(&mut s, tx.clone());
     let mut tick = time::interval(Duration::from_millis(150));
+    let mut sessions_tick = time::interval(Duration::from_secs(1));
+    sessions_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    sessions_tick.tick().await;
     loop {
         t.draw(|f| ui::draw(f, &s))?;
         tokio::select! {
@@ -140,6 +147,7 @@ pub async fn run(
                 },
                 (_, None) => break,
             },
+            _ = sessions_tick.tick() => refresh_sessions_background(&mut s, tx.clone()),
             _ = tick.tick(), if s.loading => s.spinner = (s.spinner + 1) % 6,
         }
     }
@@ -190,6 +198,16 @@ fn handle_background_action(
                 if let Ok(status) = result {
                     state.git_status_cache.insert(path, status.clone());
                     state.git_status = Some(status);
+                }
+            }
+        }
+        Action::SessionsLoaded { generation, result } => {
+            if generation == state.sessions_refresh_generation {
+                state.sessions_refresh_pending = false;
+                if let Ok(sessions) = result
+                    && sessions != state.sessions
+                {
+                    state.sessions = sessions;
                 }
             }
         }
@@ -255,10 +273,32 @@ async fn wait(tx: Sender<Action>) {
 }
 
 fn refresh_sessions(state: &mut AppState) {
+    state.sessions_refresh_generation += 1;
+    state.sessions_refresh_pending = false;
     match state.session_backend.list() {
-        Ok(sessions) => state.sessions = sessions,
+        Ok(sessions) if sessions != state.sessions => state.sessions = sessions,
+        Ok(_) => {}
         Err(error) => state.status = error.to_string(),
     }
+}
+
+/// Refreshes tmux sessions without blocking the application event loop.
+fn refresh_sessions_background(state: &mut AppState, tx: Sender<Action>) {
+    if state.sessions_refresh_pending {
+        return;
+    }
+    state.sessions_refresh_generation += 1;
+    state.sessions_refresh_pending = true;
+    let generation = state.sessions_refresh_generation;
+    let backend = state.session_backend.clone();
+    tokio::spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || backend.list().map_err(|error| error.to_string()))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+        let _ = tx.send(Action::SessionsLoaded { generation, result }).await;
+    });
 }
 
 fn request_git_status(state: &mut AppState, tx: Sender<Action>) {
