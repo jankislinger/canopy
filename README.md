@@ -30,15 +30,19 @@ Omit settings you do not need; omitted values keep their defaults. Restart Canop
 ```json
 {
   "extra_skipped_dirs": ["vendor"],
-  "editor": "nvim --clean",
-  "agent": "codex",
+  "commands": {
+    "editor": "nvim --clean",
+    "agent": "codex"
+  },
   "directory_overrides": {
     "~/Projects/archived": { "display": "hidden" },
     "~/Projects/monorepo/python_libs": { "display": "collapsed" },
     "~/Projects/special": {
       "display": "expanded",
-      "editor": "nvim --listen /tmp/special.nvim",
-      "agent": "codex --full-auto"
+      "commands": {
+        "editor": "nvim --listen /tmp/special.nvim",
+        "agent": "codex --full-auto"
+      }
     }
   }
 }
@@ -52,7 +56,7 @@ Directory override keys must be absolute paths or start with `~/`; they match th
 - `collapsed`: discover its children, but start with them collapsed. Select the directory and press `Right` to expand it.
 - `expanded`: start with its children visible. This is the default.
 
-Global `editor` and `agent` values are command strings run through tmux's shell when Canopy creates a project session. A directory override can replace either command for that directory. Settings affect newly created sessions; they do not change commands in sessions that are already running.
+Set the global editor and agent command strings under `commands`. A directory override can replace either command under its own `commands` object. Commands run through tmux's shell when Canopy creates a project session. Settings affect newly created sessions; they do not change commands in sessions that are already running.
 
 ## Development
 

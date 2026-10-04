@@ -17,10 +17,16 @@ pub enum DisplayMode {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct DirectoryOverride {
-    pub display: Option<DisplayMode>,
+pub struct CommandOverrides {
     pub editor: Option<String>,
     pub agent: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryOverride {
+    pub display: Option<DisplayMode>,
+    pub commands: Option<CommandOverrides>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,8 +42,7 @@ pub struct Settings {
 struct SettingsFile {
     skipped_dirs: Option<Vec<String>>,
     extra_skipped_dirs: Option<Vec<String>>,
-    editor: Option<String>,
-    agent: Option<String>,
+    commands: Option<CommandOverrides>,
     #[serde(default)]
     directory_overrides: HashMap<String, DirectoryOverride>,
 }
@@ -99,10 +104,11 @@ impl Settings {
             }
         }
 
+        let commands = file.commands.unwrap_or_default();
         Ok(Self {
             skipped_dirs,
-            editor: file.editor.unwrap_or_else(|| "nvim".into()),
-            agent: file.agent.unwrap_or_else(|| "codex".into()),
+            editor: commands.editor.unwrap_or_else(|| "nvim".into()),
+            agent: commands.agent.unwrap_or_else(|| "codex".into()),
             directory_overrides,
         })
     }
@@ -113,13 +119,15 @@ impl Settings {
 
     pub fn editor_for(&self, path: &Path) -> &str {
         self.override_for(path)
-            .and_then(|settings| settings.editor.as_deref())
+            .and_then(|settings| settings.commands.as_ref())
+            .and_then(|commands| commands.editor.as_deref())
             .unwrap_or(&self.editor)
     }
 
     pub fn agent_for(&self, path: &Path) -> &str {
         self.override_for(path)
-            .and_then(|settings| settings.agent.as_deref())
+            .and_then(|settings| settings.commands.as_ref())
+            .and_then(|commands| commands.agent.as_deref())
             .unwrap_or(&self.agent)
     }
 
@@ -205,7 +213,8 @@ mod tests {
 
     #[test]
     fn wrong_types_and_unknown_fields_are_rejected() {
-        assert!(parse(r#"{"editor": 4}"#, Path::new("/home/test")).is_err());
+        assert!(parse(r#"{"editor": "nvim"}"#, Path::new("/home/test")).is_err());
+        assert!(parse(r#"{"commands": {"editor": 4}}"#, Path::new("/home/test")).is_err());
         assert!(parse(r#"{"unknown": true}"#, Path::new("/home/test")).is_err());
     }
 
@@ -230,12 +239,14 @@ mod tests {
     fn resolves_override_paths_and_commands() {
         let settings = parse(
             r#"{
-                "editor": "nvim --clean",
-                "agent": "codex --full-auto",
+                "commands": {
+                    "editor": "nvim --clean",
+                    "agent": "codex --full-auto"
+                },
                 "directory_overrides": {
                     "~/my_dir": {
                         "display": "hidden",
-                        "editor": "nvim --listen socket"
+                        "commands": { "editor": "nvim --listen socket" }
                     }
                 }
             }"#,
