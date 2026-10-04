@@ -2,6 +2,12 @@
 
 `canopy` is a terminal project manager built with Rust and Ratatui. It is intended to grow into a terminal-native alternative to opening many projects in separate IDE windows.
 
+## Installation
+
+```bash
+cargo install --git https://github.com/jankislinger/canopy.git
+```
+
 ## Current functionality
 
 The application currently:
