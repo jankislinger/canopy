@@ -11,7 +11,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
     let a = Layout::vertical([Constraint::Min(8), Constraint::Length(5)]).split(f.area());
     let p =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(a[0]);
-    let rs = rows(&s.home, &s.repositories, &s.expanded);
+    let rs = rows(&s.home, &s.repositories, &s.expanded, &s.settings, s.show_hidden);
     let list_width = p[0].width.saturating_sub(2) as usize;
     let items = rs
         .iter()
@@ -53,14 +53,15 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
                 )
             };
             let text = format!("{left}{gap}{right}");
-            ListItem::new(Line::from(Span::styled(
-                text,
-                if r.path == s.selected {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            )))
+            let style = if r.hidden {
+                let style = Style::default().fg(Color::DarkGray);
+                if r.path == s.selected { style.add_modifier(Modifier::BOLD) } else { style }
+            } else if r.path == s.selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(text, style)))
         })
         .collect::<Vec<_>>();
     f.render_widget(List::new(items).block(Block::bordered().title("Projects")), p[0]);
@@ -68,7 +69,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
     f.render_widget(
         Paragraph::new(vec![
             Line::from("Enter: switch  s: start  x: stop"),
-            Line::from("t: test  l: lint  r: refresh"),
+            Line::from("t: test  l: lint  r: refresh  H: hidden"),
             Line::from("Esc: close popup  q: quit"),
             Line::from(if s.confirmation.is_some() { "Confirm stop: y/n" } else { &s.status }),
         ])
@@ -111,6 +112,16 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
             )
             .scroll((popup.scroll, 0))
             .wrap(ratatui::widgets::Wrap { trim: false }),
+            area,
+        );
+    }
+    if let Some(error) = &s.error_popup {
+        let area = centered_rect(70, 9, f.area());
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(error.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::bordered().title("Settings error")),
             area,
         );
     }
@@ -184,6 +195,7 @@ mod tests {
             git::{GitCommit, GitStatus, WorkingTree},
             sessions::SessionBackend,
         },
+        config::Settings,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use std::{collections::HashSet, path::PathBuf};
@@ -195,6 +207,9 @@ mod tests {
             home: PathBuf::from("/home/test"),
             selected: PathBuf::from("/home/test/repo"),
             expanded: HashSet::new(),
+            show_hidden: false,
+            settings: Settings::default(),
+            error_popup: None,
             loading: false,
             completed: 0,
             spinner: 0,

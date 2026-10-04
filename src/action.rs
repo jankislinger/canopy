@@ -9,6 +9,7 @@ pub enum Action {
     Down,
     Left,
     Right,
+    ToggleHidden,
     Open,
     Refresh,
     Start,
@@ -62,6 +63,7 @@ impl Action {
             KeyCode::Down => Self::Down,
             KeyCode::Left => Self::Left,
             KeyCode::Right => Self::Right,
+            KeyCode::Char('H') => Self::ToggleHidden,
             KeyCode::Enter => Self::Open,
             KeyCode::Char('s') => Self::Start,
             KeyCode::Char('x') => Self::Stop,
@@ -71,5 +73,16 @@ impl Action {
             KeyCode::Char('l') => Self::Lint,
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Action;
+    use crossterm::event::KeyCode;
+
+    #[test]
+    fn capital_h_toggles_hidden_entries() {
+        assert!(matches!(Action::from_key(KeyCode::Char('H')), Some(Action::ToggleHidden)));
     }
 }

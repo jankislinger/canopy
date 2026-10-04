@@ -54,8 +54,13 @@ impl SessionBackend {
 
     /// Creates a detached project session rooted at `project_path`.
     ///
-    /// The first tmux window runs `nvim`; the second is an empty shell window.
-    pub fn create(&self, project_path: &Path) -> Result<String, SessionError> {
+    /// The first two tmux windows run the supplied editor and agent commands.
+    pub fn create(
+        &self,
+        project_path: &Path,
+        editor_command: &str,
+        agent_command: &str,
+    ) -> Result<String, SessionError> {
         let path = project_path.canonicalize().map_err(|error| {
             SessionError::Command(format!("cannot resolve {}: {error}", project_path.display()))
         })?;
@@ -69,17 +74,17 @@ impl SessionBackend {
             "editor".into(),
             "-c".into(),
             path.display().to_string(),
-            "nvim".into(),
+            editor_command.into(),
         ])?;
         self.command_owned(vec![
             "new-window".into(),
             "-t".into(),
             name.clone(),
             "-n".into(),
-            "codex".into(),
+            "agent".into(),
             "-c".into(),
             path.display().to_string(),
-            "codex".into(),
+            agent_command.into(),
         ])?;
         self.command_owned(vec![
             "new-window".into(),

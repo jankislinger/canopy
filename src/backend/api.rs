@@ -36,7 +36,7 @@ pub struct Repository {
     pub path: PathBuf,
     pub projects: Vec<Project>,
 }
-const SKIPPED_DIRS: [&str; 6] =
+pub const DEFAULT_SKIPPED_DIRS: [&str; 6] =
     ["target", "node_modules", ".venv", "__pycache__", ".cache", "build"];
 
 /// Returns the current user's home directory from the `HOME` environment variable.
@@ -44,10 +44,11 @@ pub fn home_dir() -> color_eyre::Result<PathBuf> {
     env::var_os("HOME").map(PathBuf::from).ok_or_else(|| color_eyre::eyre::eyre!("HOME is not set"))
 }
 
-/// Discovers Git repositories and nested Python/Rust projects below `root`.
-///
-/// Hidden directories and common generated or dependency directories are skipped.
-pub fn discover_repositories(root: &Path) -> color_eyre::Result<Vec<Repository>> {
+/// Discovers repositories while skipping directories whose names occur in `skipped_dirs`.
+pub fn discover_repositories_with_skipped_dirs(
+    root: &Path,
+    skipped_dirs: &[String],
+) -> color_eyre::Result<Vec<Repository>> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
@@ -64,12 +65,12 @@ pub fn discover_repositories(root: &Path) -> color_eyre::Result<Vec<Repository>>
                 is_repo = true;
                 continue;
             }
-            if path.is_dir() && !name.starts_with('.') && !SKIPPED_DIRS.contains(&name.as_str()) {
+            if path.is_dir() && !name.starts_with('.') && !is_skipped(&name, skipped_dirs) {
                 children.push(path)
             }
         }
         if is_repo {
-            found.push(make_repository(directory))
+            found.push(make_repository(directory, skipped_dirs))
         }
         stack.extend(children)
     }
@@ -78,7 +79,7 @@ pub fn discover_repositories(root: &Path) -> color_eyre::Result<Vec<Repository>>
 }
 
 /// Creates the project group and project metadata for one Git repository.
-fn make_repository(path: PathBuf) -> Repository {
+fn make_repository(path: PathBuf, skipped_dirs: &[String]) -> Repository {
     let root =
         Project::try_from_path(path.clone()).expect("repository root must have a Git marker");
     let mut projects = vec![root];
@@ -88,7 +89,7 @@ fn make_repository(path: PathBuf) -> Repository {
         for entry in entries.flatten() {
             let child = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !child.is_dir() || name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str()) {
+            if !child.is_dir() || name.starts_with('.') || is_skipped(&name, skipped_dirs) {
                 continue;
             }
 
@@ -105,6 +106,10 @@ fn make_repository(path: PathBuf) -> Repository {
     }
     projects.sort_by(|a, b| a.path.cmp(&b.path));
     Repository { path, projects }
+}
+
+fn is_skipped(name: &str, skipped_dirs: &[String]) -> bool {
+    skipped_dirs.iter().any(|skipped| skipped == name)
 }
 
 #[cfg(test)]
@@ -136,10 +141,15 @@ mod tests {
         let p = r.join("python");
         fs::create_dir_all(&p).unwrap();
         fs::write(p.join("pyproject.toml"), "").unwrap();
-        let repos = discover_repositories(&t.0).unwrap();
+        let skipped_dirs =
+            DEFAULT_SKIPPED_DIRS.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        let repos = discover_repositories_with_skipped_dirs(&t.0, &skipped_dirs).unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].projects.len(), 2);
         assert_eq!(repos[0].projects[0].kinds, vec![ProjectKind::Git, ProjectKind::Rust]);
         assert_eq!(repos[0].projects[1].kinds, vec![ProjectKind::Python]);
+
+        let filtered = discover_repositories_with_skipped_dirs(&t.0, &["python".into()]).unwrap();
+        assert_eq!(filtered[0].projects.len(), 1);
     }
 }

@@ -2,6 +2,7 @@ use crate::{
     action::Action,
     backend::sessions::{Session, SessionBackend},
     backend::{Project, ProjectKind, Repository, git::GitStatus},
+    config::{DisplayMode, Settings},
     ui,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -33,6 +34,9 @@ pub struct AppState {
     pub home: PathBuf,
     pub selected: PathBuf,
     pub expanded: HashSet<PathBuf>,
+    pub show_hidden: bool,
+    pub settings: Settings,
+    pub error_popup: Option<String>,
     pub loading: bool,
     pub completed: usize,
     pub spinner: usize,
@@ -56,9 +60,11 @@ impl AppState {
         home: PathBuf,
         repositories: Vec<Repository>,
         session_backend: SessionBackend,
+        settings: Settings,
+        settings_error: Option<String>,
     ) -> Self {
-        let expanded = all_dirs(&home, &repositories);
-        let selected = rows(&home, &repositories, &expanded)
+        let expanded = initial_expanded(&home, &repositories, &settings);
+        let selected = rows(&home, &repositories, &expanded, &settings, false)
             .first()
             .map(|r| r.path.clone())
             .unwrap_or_else(|| home.clone());
@@ -67,6 +73,9 @@ impl AppState {
             home,
             selected,
             expanded,
+            show_hidden: false,
+            settings,
+            error_popup: settings_error,
             loading: false,
             completed: 0,
             spinner: 0,
@@ -101,7 +110,13 @@ pub async fn run(
     loop {
         t.draw(|f| ui::draw(f, &s))?;
         tokio::select! {
-            action = rx.recv() => match (s.command_popup.as_ref(), action) {
+            action = rx.recv() => if s.error_popup.is_some() {
+                match action {
+                    Some(Action::Quit | Action::Cancel | Action::Open) => s.error_popup = None,
+                    Some(action) => { let _ = handle_background_action(&mut s, action, tx.clone()); }
+                    None => break,
+                }
+            } else { match (s.command_popup.as_ref(), action) {
                 (None, Some(action)) => match action {
                     Action::Quit => break,
                     Action::Up => {
@@ -118,6 +133,7 @@ pub async fn run(
                     Action::Right => {
                         if has_child(&s) { s.expanded.insert(s.selected.clone()); }
                     }
+                    Action::ToggleHidden => toggle_hidden(&mut s, tx.clone()),
                     Action::Open => activate(&mut s),
                     Action::Start => start(&mut s),
                     Action::Stop => request_stop(&mut s),
@@ -146,7 +162,7 @@ pub async fn run(
                     action => { let _ = handle_background_action(&mut s, action, tx.clone()); }
                 },
                 (_, None) => break,
-            },
+            }},
             _ = sessions_tick.tick() => refresh_sessions_background(&mut s, tx.clone()),
             _ = tick.tick(), if s.loading => s.spinner = (s.spinner + 1) % 6,
         }
@@ -223,7 +239,13 @@ fn handle_background_action(
                             .filter(|path| available.contains(path))
                             .collect();
                         state.expanded.insert(state.home.clone());
-                        let visible = rows(&state.home, &state.repositories, &state.expanded);
+                        let visible = rows(
+                            &state.home,
+                            &state.repositories,
+                            &state.expanded,
+                            &state.settings,
+                            state.show_hidden,
+                        );
                         if !visible.iter().any(|row| row.path == state.selected) {
                             state.selected = visible
                                 .first()
@@ -255,12 +277,14 @@ fn refresh_projects(state: &mut AppState, tx: Sender<Action>) {
     state.project_scan_generation += 1;
     let generation = state.project_scan_generation;
     let home = state.home.clone();
+    let skipped_dirs = state.settings.skipped_dirs.clone();
     tokio::spawn(async move {
-        let result =
-            tokio::task::spawn_blocking(move || crate::backend::discover_repositories(&home))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result.map_err(|error| error.to_string()));
+        let result = tokio::task::spawn_blocking(move || {
+            crate::backend::discover_repositories_with_skipped_dirs(&home, &skipped_dirs)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
         let _ = tx.send(Action::ProjectsLoaded { generation, result }).await;
     });
     state.status = "Scanning projects...".into();
@@ -333,7 +357,9 @@ fn session_name(state: &AppState) -> Option<String> {
 }
 fn start(state: &mut AppState) {
     if let Some(name) = session_name(state) {
-        match state.session_backend.create(&state.selected) {
+        let editor = state.settings.editor_for(&state.selected);
+        let agent = state.settings.agent_for(&state.selected);
+        match state.session_backend.create(&state.selected, editor, agent) {
             Ok(_) => {
                 refresh_sessions(state);
                 state.status = format!("Started {name}");
@@ -344,12 +370,14 @@ fn start(state: &mut AppState) {
 }
 fn activate(state: &mut AppState) {
     if let Some(name) = session_name(state) {
+        let editor = state.settings.editor_for(&state.selected);
+        let agent = state.settings.agent_for(&state.selected);
         let result = if state.sessions.iter().any(|session| session.name == name) {
             state.session_backend.switch_to(&name)
         } else {
             state
                 .session_backend
-                .create(&state.selected)
+                .create(&state.selected, editor, agent)
                 .and_then(|_| state.session_backend.switch_to(&name))
         };
         match result {
@@ -519,10 +547,17 @@ pub struct Row {
     pub path: PathBuf,
     pub depth: usize,
     pub kinds: Option<Vec<ProjectKind>>,
+    pub hidden: bool,
 }
 
 /// Produces the visible filesystem-tree rows for the discovered projects.
-pub fn rows(home: &Path, repos: &[Repository], expanded: &HashSet<PathBuf>) -> Vec<Row> {
+pub fn rows(
+    home: &Path,
+    repos: &[Repository],
+    expanded: &HashSet<PathBuf>,
+    settings: &Settings,
+    show_hidden: bool,
+) -> Vec<Row> {
     let mut set = BTreeSet::new();
     for r in repos {
         for p in &r.projects {
@@ -542,6 +577,14 @@ pub fn rows(home: &Path, repos: &[Repository], expanded: &HashSet<PathBuf>) -> V
             if p == home {
                 return None;
             }
+            let is_hidden = settings.display_for(&p) == DisplayMode::Hidden;
+            let has_hidden_ancestor = p
+                .ancestors()
+                .take_while(|ancestor| *ancestor != home)
+                .any(|ancestor| settings.display_for(ancestor) == DisplayMode::Hidden);
+            if !show_hidden && (is_hidden || has_hidden_ancestor) {
+                return None;
+            }
             if p != home
                 && !p.ancestors().skip(1).all(|a| !a.starts_with(home) || expanded.contains(a))
             {
@@ -549,7 +592,12 @@ pub fn rows(home: &Path, repos: &[Repository], expanded: &HashSet<PathBuf>) -> V
             }
             let depth =
                 p.strip_prefix(home).map(|x| x.components().count()).unwrap_or(1).saturating_sub(1);
-            Some(Row { path: p.clone(), depth, kinds: project(repos, &p).map(|x| x.kinds.clone()) })
+            Some(Row {
+                path: p.clone(),
+                depth,
+                kinds: project(repos, &p).map(|x| x.kinds.clone()),
+                hidden: is_hidden,
+            })
         })
         .collect()
 }
@@ -578,7 +626,7 @@ fn has_child(s: &AppState) -> bool {
 
 /// Moves selection through the currently visible tree rows.
 fn select(s: &mut AppState, d: i32) {
-    let r = rows(&s.home, &s.repositories, &s.expanded);
+    let r = rows(&s.home, &s.repositories, &s.expanded, &s.settings, s.show_hidden);
     if let Some(i) = r.iter().position(|x| x.path == s.selected) {
         s.selected = r[(i as i32 + d).clamp(0, r.len() as i32 - 1) as usize].path.clone()
     }
@@ -599,4 +647,94 @@ fn all_dirs(h: &Path, r: &[Repository]) -> HashSet<PathBuf> {
         }
     }
     s
+}
+
+fn initial_expanded(
+    home: &Path,
+    repositories: &[Repository],
+    settings: &Settings,
+) -> HashSet<PathBuf> {
+    let mut expanded = all_dirs(home, repositories);
+    for path in expanded.clone() {
+        match settings.display_for(&path) {
+            DisplayMode::Hidden | DisplayMode::Expanded => {
+                expanded.insert(path);
+            }
+            DisplayMode::Collapsed => {
+                expanded.remove(&path);
+            }
+        }
+    }
+    expanded
+}
+
+fn toggle_hidden(state: &mut AppState, tx: Sender<Action>) {
+    state.show_hidden = !state.show_hidden;
+    let visible =
+        rows(&state.home, &state.repositories, &state.expanded, &state.settings, state.show_hidden);
+    if !visible.iter().any(|row| row.path == state.selected) {
+        let mut ancestor = state.selected.parent();
+        state.selected = std::iter::from_fn(|| {
+            let path = ancestor?;
+            ancestor = path.parent();
+            Some(path.to_path_buf())
+        })
+        .find(|path| visible.iter().any(|row| row.path == *path))
+        .or_else(|| visible.first().map(|row| row.path.clone()))
+        .unwrap_or_else(|| state.home.clone());
+        request_git_status(state, tx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DirectoryOverride;
+
+    fn tree() -> (PathBuf, Vec<Repository>, PathBuf, PathBuf) {
+        let home = PathBuf::from("/home/test");
+        let repository = home.join("my-repo");
+        let intermediate = repository.join("python_libs");
+        let project = intermediate.join("my-lib");
+        let repositories = vec![Repository {
+            path: repository.clone(),
+            projects: vec![
+                Project { path: repository.clone(), kinds: vec![ProjectKind::Git] },
+                Project { path: project.clone(), kinds: vec![ProjectKind::Python] },
+            ],
+        }];
+        (home, repositories, intermediate, project)
+    }
+
+    #[test]
+    fn collapsed_override_starts_closed() {
+        let (home, repositories, intermediate, _) = tree();
+        let mut settings = Settings::default();
+        settings.directory_overrides.insert(
+            intermediate.clone(),
+            DirectoryOverride { display: Some(DisplayMode::Collapsed), ..Default::default() },
+        );
+
+        let expanded = initial_expanded(&home, &repositories, &settings);
+        assert!(!expanded.contains(&intermediate));
+        assert!(expanded.contains(&home.join("my-repo")));
+    }
+
+    #[test]
+    fn hidden_override_hides_subtree_until_revealed() {
+        let (home, repositories, intermediate, project) = tree();
+        let mut settings = Settings::default();
+        settings.directory_overrides.insert(
+            intermediate.clone(),
+            DirectoryOverride { display: Some(DisplayMode::Hidden), ..Default::default() },
+        );
+        let expanded = all_dirs(&home, &repositories);
+
+        let concealed = rows(&home, &repositories, &expanded, &settings, false);
+        assert!(!concealed.iter().any(|row| row.path == intermediate || row.path == project));
+
+        let revealed = rows(&home, &repositories, &expanded, &settings, true);
+        assert!(revealed.iter().any(|row| row.path == intermediate && row.hidden));
+        assert!(revealed.iter().any(|row| row.path == project && !row.hidden));
+    }
 }
