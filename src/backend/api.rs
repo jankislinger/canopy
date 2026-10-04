@@ -14,6 +14,23 @@ pub struct Project {
     pub path: PathBuf,
     pub kinds: Vec<ProjectKind>,
 }
+impl Project {
+    /// Detects a project from its Git, Python, and Rust markers, if any are present.
+    pub fn try_from_path(path: impl Into<PathBuf>) -> Option<Self> {
+        let path = path.into();
+        let mut kinds = Vec::new();
+        if path.join(".git").is_dir() {
+            kinds.push(ProjectKind::Git);
+        }
+        if path.join("pyproject.toml").is_file() {
+            kinds.push(ProjectKind::Python);
+        }
+        if path.join("Cargo.toml").is_file() {
+            kinds.push(ProjectKind::Rust);
+        }
+        (!kinds.is_empty()).then_some(Self { path, kinds })
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Repository {
     pub path: PathBuf,
@@ -27,7 +44,7 @@ pub fn home_dir() -> color_eyre::Result<PathBuf> {
     env::var_os("HOME").map(PathBuf::from).ok_or_else(|| color_eyre::eyre::eyre!("HOME is not set"))
 }
 
-/// Discovers Git repositories and their direct child Python/Rust projects below `root`.
+/// Discovers Git repositories and nested Python/Rust projects below `root`.
 ///
 /// Hidden directories and common generated or dependency directories are skipped.
 pub fn discover_repositories(root: &Path) -> color_eyre::Result<Vec<Repository>> {
@@ -62,30 +79,28 @@ pub fn discover_repositories(root: &Path) -> color_eyre::Result<Vec<Repository>>
 
 /// Creates the project group and project metadata for one Git repository.
 fn make_repository(path: PathBuf) -> Repository {
-    let mut root_kinds = vec![ProjectKind::Git];
-    if path.join("pyproject.toml").is_file() {
-        root_kinds.push(ProjectKind::Python)
-    }
-    if path.join("Cargo.toml").is_file() {
-        root_kinds.push(ProjectKind::Rust)
-    }
-    let mut projects = vec![Project { path: path.clone(), kinds: root_kinds }];
-    if let Ok(entries) = fs::read_dir(&path) {
+    let root =
+        Project::try_from_path(path.clone()).expect("repository root must have a Git marker");
+    let mut projects = vec![root];
+    let mut stack = vec![path.clone()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else { continue };
         for entry in entries.flatten() {
             let child = entry.path();
-            if !child.is_dir() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !child.is_dir() || name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            let mut kinds = Vec::new();
-            if child.join("pyproject.toml").is_file() {
-                kinds.push(ProjectKind::Python)
+
+            // Nested Git repositories are discovered independently by the outer scan.
+            if child.join(".git").exists() {
+                continue;
             }
-            if child.join("Cargo.toml").is_file() {
-                kinds.push(ProjectKind::Rust)
+
+            if let Some(project) = Project::try_from_path(child.clone()) {
+                projects.push(project)
             }
-            if !kinds.is_empty() {
-                projects.push(Project { path: child, kinds })
-            }
+            stack.push(child);
         }
     }
     projects.sort_by(|a, b| a.path.cmp(&b.path));
