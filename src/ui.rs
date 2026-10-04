@@ -12,6 +12,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
     let p =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(a[0]);
     let rs = rows(&s.home, &s.repositories, &s.expanded);
+    let list_width = p[0].width.saturating_sub(2) as usize;
     let items = rs
         .iter()
         .map(|r| {
@@ -26,20 +27,32 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
                 .map(|_| {
                     let name = crate::backend::sessions::session_name(&r.path);
                     match s.sessions.iter().find(|session| session.name == name) {
-                        Some(session) if session.attached_clients > 0 => "● attached",
-                        Some(_) => "● running",
-                        None => "○ stopped",
+                        Some(session) if session.attached_clients > 0 => "●  attached",
+                        Some(_) => "●   running",
+                        None => "○   stopped",
                     }
                 })
                 .unwrap_or("");
-            let text = format!(
-                "{}{:indent$}{m} {} {} {session_status}",
+            let left = format!(
+                "{}{:indent$}{m} {n}",
                 if r.path == s.selected { "›" } else { " " },
                 "",
-                k.map(|x| format!("[{x}]")).unwrap_or_default(),
-                n,
                 indent = r.depth * 2
             );
+            let right = match (k, session_status.is_empty()) {
+                (Some(k), false) => format!("[{k}]  {session_status}"),
+                (Some(k), true) => format!("[{k}]"),
+                (None, false) => session_status.to_owned(),
+                (None, true) => String::new(),
+            };
+            let gap = if right.is_empty() {
+                String::new()
+            } else {
+                " ".repeat(
+                    list_width.saturating_sub(left.chars().count() + right.chars().count()).max(1),
+                )
+            };
+            let text = format!("{left}{gap}{right}");
             ListItem::new(Line::from(Span::styled(
                 text,
                 if r.path == s.selected {
