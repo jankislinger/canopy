@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, Paragraph},
 };
 /// Renders the project tree, details pane, and command hints.
-pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
+pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
     let a = Layout::vertical([Constraint::Min(8), Constraint::Length(5)]).split(f.area());
     let p =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(a[0]);
@@ -16,7 +16,11 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
     let items = rs
         .iter()
         .map(|r| {
-            let child = rs.iter().any(|x| x.path.parent() == Some(r.path.as_path()));
+            let child = s
+                .repositories
+                .iter()
+                .flat_map(|repo| &repo.projects)
+                .any(|project| project.path != r.path && project.path.starts_with(&r.path));
             let m =
                 if child { if s.expanded.contains(&r.path) { "▾" } else { "▸" } } else { " " };
             let k = r.kinds.as_ref().map(|x| x.iter().map(kind).collect::<Vec<_>>().join(","));
@@ -64,7 +68,12 @@ pub fn draw(f: &mut ratatui::Frame, s: &AppState) {
             ListItem::new(Line::from(Span::styled(text, style)))
         })
         .collect::<Vec<_>>();
-    f.render_widget(List::new(items).block(Block::bordered().title("Projects")), p[0]);
+    s.project_list_state.select(rs.iter().position(|row| row.path == s.selected));
+    f.render_stateful_widget(
+        List::new(items).block(Block::bordered().title("Projects")).scroll_padding(1),
+        p[0],
+        &mut s.project_list_state,
+    );
     f.render_widget(details(s), p[1]);
     f.render_widget(
         Paragraph::new(vec![
@@ -188,10 +197,11 @@ fn centered_rect(
 
 #[cfg(test)]
 mod tests {
-    use super::details;
+    use super::{details, draw};
     use crate::{
         app::AppState,
         backend::{
+            Project, ProjectKind, Repository,
             git::{GitCommit, GitStatus, WorkingTree},
             sessions::SessionBackend,
         },
@@ -200,12 +210,12 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use std::{collections::HashSet, path::PathBuf};
 
-    #[test]
-    fn details_renders_six_characters_for_every_commit_sha() {
-        let state = AppState {
+    fn test_state() -> AppState {
+        AppState {
             repositories: Vec::new(),
             home: PathBuf::from("/home/test"),
             selected: PathBuf::from("/home/test/repo"),
+            project_list_state: Default::default(),
             expanded: HashSet::new(),
             show_hidden: false,
             settings: Settings::default(),
@@ -246,7 +256,12 @@ mod tests {
             git_status_generation: 0,
             sessions_refresh_generation: 0,
             sessions_refresh_pending: false,
-        };
+        }
+    }
+
+    #[test]
+    fn details_renders_six_characters_for_every_commit_sha() {
+        let state = test_state();
         let backend = TestBackend::new(100, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| frame.render_widget(details(&state), frame.area())).unwrap();
@@ -256,5 +271,64 @@ mod tests {
             let rendered: String = (1..7).map(|x| buffer[(x, y)].symbol()).collect();
             assert_eq!(rendered, expected);
         }
+    }
+
+    #[test]
+    fn directory_arrows_show_collapsed_and_expanded_states() {
+        let mut state = test_state();
+        let repository = state.selected.clone();
+        state.repositories = vec![Repository {
+            path: repository.clone(),
+            projects: vec![
+                Project { path: repository.clone(), kinds: vec![ProjectKind::Git] },
+                Project { path: repository.join("library"), kinds: vec![ProjectKind::Rust] },
+            ],
+        }];
+        state.expanded.insert(state.home.clone());
+        let mut terminal = Terminal::new(TestBackend::new(100, 15)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(2, 1)].symbol(), "▸");
+
+        state.expanded.insert(repository);
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(2, 1)].symbol(), "▾");
+        assert_eq!(buffer[(4, 2)].symbol(), " ");
+    }
+
+    #[test]
+    fn project_list_scrolls_before_selection_reaches_the_bottom() {
+        let mut state = test_state();
+        let projects: Vec<_> = (0..20)
+            .map(|index| Project {
+                path: state.home.join(format!("project-{index:02}")),
+                kinds: vec![ProjectKind::Git],
+            })
+            .collect();
+        state.repositories = vec![Repository { path: state.home.clone(), projects }];
+        state.expanded.insert(state.home.clone());
+        let mut terminal = Terminal::new(TestBackend::new(100, 15)).unwrap();
+
+        for (index, expected_offset) in [(0, 0), (6, 0), (7, 1), (15, 9), (0, 0)] {
+            state.selected = state.home.join(format!("project-{index:02}"));
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            assert_eq!(state.project_list_state.offset(), expected_offset);
+            let selected_y = 1 + (index - expected_offset) as u16;
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(1, selected_y)].symbol(), "›");
+            let below: String = (1..49).map(|x| buffer[(x, selected_y + 1)].symbol()).collect();
+            assert!(below.contains(&format!("project-{:02}", index + 1)));
+        }
+
+        // A smaller viewport must still show the next project below the selected one.
+        state.selected = state.home.join("project-15");
+        terminal.backend_mut().resize(100, 13);
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        assert_eq!(state.project_list_state.offset(), 11);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 5)].symbol(), "›");
+        let below: String = (1..49).map(|x| buffer[(x, 6)].symbol()).collect();
+        assert!(below.contains("project-16"));
     }
 }

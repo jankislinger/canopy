@@ -6,7 +6,7 @@ use crate::{
     ui,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use ratatui::DefaultTerminal;
+use ratatui::{DefaultTerminal, widgets::ListState};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     io::Read,
@@ -33,6 +33,7 @@ pub struct AppState {
     pub repositories: Vec<Repository>,
     pub home: PathBuf,
     pub selected: PathBuf,
+    pub project_list_state: ListState,
     pub expanded: HashSet<PathBuf>,
     pub show_hidden: bool,
     pub settings: Settings,
@@ -72,6 +73,7 @@ impl AppState {
             repositories,
             home,
             selected,
+            project_list_state: ListState::default(),
             expanded,
             show_hidden: false,
             settings,
@@ -108,7 +110,7 @@ pub async fn run(
     sessions_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     sessions_tick.tick().await;
     loop {
-        t.draw(|f| ui::draw(f, &s))?;
+        t.draw(|f| ui::draw(f, &mut s))?;
         tokio::select! {
             action = rx.recv() => if s.error_popup.is_some() {
                 match action {
