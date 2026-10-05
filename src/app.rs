@@ -21,6 +21,28 @@ pub enum Confirmation {
     StopSession,
 }
 
+#[derive(Clone, Copy)]
+enum CommandKind {
+    Test,
+    Lint,
+}
+
+impl CommandKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Test => "Test",
+            Self::Lint => "Lint",
+        }
+    }
+
+    fn recipe(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Lint => "lint",
+        }
+    }
+}
+
 pub struct CommandPopup {
     pub title: String,
     pub output: String,
@@ -147,8 +169,8 @@ pub async fn run(
                         s.confirmation = None;
                         s.status.clear();
                     }
-                    Action::Test => run_command(&mut s, false, tx.clone()),
-                    Action::Lint => run_command(&mut s, true, tx.clone()),
+                    Action::Test => run_command(&mut s, CommandKind::Test, tx.clone()),
+                    Action::Lint => run_command(&mut s, CommandKind::Lint, tx.clone()),
                     Action::Refresh => refresh_projects(&mut s, tx.clone()),
                     action => { let _ = handle_background_action(&mut s, action, tx.clone()); }
                 },
@@ -411,13 +433,13 @@ fn stop(state: &mut AppState) {
     state.confirmation = None;
 }
 
-fn run_command(state: &mut AppState, lint: bool, tx: Sender<Action>) {
+fn run_command(state: &mut AppState, command: CommandKind, tx: Sender<Action>) {
     let Some(project) = project(&state.repositories, &state.selected) else {
         return;
     };
     let path = project.path.clone();
     let kinds = project.kinds.clone();
-    let title = if lint { "Lint" } else { "Test" }.to_string();
+    let title = command.title().to_string();
     state.command_generation += 1;
     let generation = state.command_generation;
     state.command_popup = Some(CommandPopup {
@@ -430,7 +452,7 @@ fn run_command(state: &mut AppState, lint: bool, tx: Sender<Action>) {
     let output_tx = tx.clone();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            execute_commands_streaming(&path, &kinds, lint, generation, output_tx)
+            execute_commands_streaming(&path, &kinds, command, generation, output_tx)
         })
         .await
         .unwrap_or_else(|error| (format!("Command task failed: {error}"), false));
@@ -462,32 +484,47 @@ fn bottom_scroll(output: &str) -> u16 {
     output.lines().count().saturating_sub(18).min(u16::MAX as usize) as u16
 }
 
+fn project_commands(
+    path: &Path,
+    kinds: &[ProjectKind],
+    command: CommandKind,
+) -> Vec<Vec<&'static str>> {
+    let declaration = format!("{}:", command.recipe());
+    let has_recipe = std::fs::read_to_string(path.join("justfile"))
+        .is_ok_and(|contents| contents.lines().any(|line| line.starts_with(&declaration)));
+    if has_recipe {
+        return vec![vec!["just", command.recipe()]];
+    }
+
+    let (python, rust) = match command {
+        CommandKind::Test => (vec![vec!["uv", "run", "pytest"]], vec![vec!["cargo", "test"]]),
+        CommandKind::Lint => (
+            vec![
+                vec!["uv", "run", "ruff", "format", "--check"],
+                vec!["uv", "run", "ruff", "check"],
+            ],
+            vec![vec!["cargo", "fmt", "--check"], vec!["cargo", "clippy"]],
+        ),
+    };
+
+    let mut commands = Vec::new();
+    if kinds.contains(&ProjectKind::Python) {
+        commands.extend(python);
+    }
+    if kinds.contains(&ProjectKind::Rust) {
+        commands.extend(rust);
+    }
+    commands
+}
+
 fn execute_commands_streaming(
     path: &Path,
     kinds: &[ProjectKind],
-    lint: bool,
+    command: CommandKind,
     generation: u64,
     tx: Sender<Action>,
 ) -> (String, bool) {
-    let mut commands = Vec::new();
-    if kinds.contains(&ProjectKind::Python) {
-        commands.push(if lint {
-            vec!["uv", "run", "ruff", "format", "--check"]
-        } else {
-            vec!["uv", "run", "pytest"]
-        });
-        if lint {
-            commands.push(vec!["uv", "run", "ruff", "check"]);
-        }
-    }
-    if kinds.contains(&ProjectKind::Rust) {
-        if lint {
-            commands.push(vec!["cargo", "fmt", "--check"]);
-            commands.push(vec!["cargo", "clippy"]);
-        } else {
-            commands.push(vec!["cargo", "test"]);
-        }
-    }
+    let commands = project_commands(path, kinds, command);
     if commands.is_empty() {
         return ("No test or lint command is defined for this project.".into(), false);
     }
@@ -692,6 +729,92 @@ fn toggle_hidden(state: &mut AppState, tx: Sender<Action>) {
 mod tests {
     use super::*;
     use crate::config::DirectoryOverride;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TempProject(PathBuf);
+
+    impl TempProject {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "canopy-commands-test-{}",
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn language_commands_keep_the_existing_defaults() {
+        let project = TempProject::new();
+        let kinds = [ProjectKind::Git, ProjectKind::Python, ProjectKind::Rust];
+        assert_eq!(
+            project_commands(&project.0, &kinds, CommandKind::Test),
+            vec![vec!["uv", "run", "pytest"], vec!["cargo", "test"]]
+        );
+        assert_eq!(
+            project_commands(&project.0, &kinds, CommandKind::Lint),
+            vec![
+                vec!["uv", "run", "ruff", "format", "--check"],
+                vec!["uv", "run", "ruff", "check"],
+                vec!["cargo", "fmt", "--check"],
+                vec!["cargo", "clippy"],
+            ]
+        );
+    }
+
+    #[test]
+    fn justfile_commands_override_language_defaults_and_work_for_git_projects() {
+        let project = TempProject::new();
+        fs::write(project.0.join("justfile"), "test:\n    true\nlint:\n    true\n").unwrap();
+        for kinds in
+            [vec![ProjectKind::Git], vec![ProjectKind::Git, ProjectKind::Python, ProjectKind::Rust]]
+        {
+            assert_eq!(
+                project_commands(&project.0, &kinds, CommandKind::Test),
+                vec![vec!["just", "test"]]
+            );
+            assert_eq!(
+                project_commands(&project.0, &kinds, CommandKind::Lint),
+                vec![vec!["just", "lint"]]
+            );
+        }
+    }
+
+    #[test]
+    fn missing_just_recipe_falls_back_to_language_commands() {
+        let project = TempProject::new();
+        let kinds = [ProjectKind::Rust];
+        fs::write(project.0.join("justfile"), "test:\n    true\n# lint:\nlint-extra:\n    true\n")
+            .unwrap();
+        assert_eq!(
+            project_commands(&project.0, &kinds, CommandKind::Test),
+            vec![vec!["just", "test"]]
+        );
+        assert_eq!(
+            project_commands(&project.0, &kinds, CommandKind::Lint),
+            vec![vec!["cargo", "fmt", "--check"], vec!["cargo", "clippy"],]
+        );
+
+        fs::write(project.0.join("justfile"), "lint:\n    true\ntest-extra:\n    true\n").unwrap();
+        assert_eq!(
+            project_commands(&project.0, &kinds, CommandKind::Test),
+            vec![vec!["cargo", "test"]]
+        );
+        assert_eq!(
+            project_commands(&project.0, &kinds, CommandKind::Lint),
+            vec![vec!["just", "lint"]]
+        );
+    }
 
     fn tree() -> (PathBuf, Vec<Repository>, PathBuf, PathBuf) {
         let home = PathBuf::from("/home/test");
