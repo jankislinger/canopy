@@ -529,7 +529,7 @@ impl AppState {
                 Some(Row {
                     path: p.clone(),
                     depth,
-                    kinds: self.project_at(&p).map(|x| x.kinds.clone()),
+                    kinds: self.project_at(&p).map(|x| x.kinds().to_vec()),
                     hidden: is_hidden,
                 })
             })
@@ -665,8 +665,8 @@ mod tests {
         let repositories = vec![Repository {
             path: repository.clone(),
             projects: vec![
-                Project { path: repository.clone(), kinds: vec![ProjectKind::Git] },
-                Project { path: project.clone(), kinds: vec![ProjectKind::Python] },
+                Project::new(repository.clone(), vec![ProjectKind::Git], None),
+                Project::new(project.clone(), vec![ProjectKind::Python], None),
             ],
         }];
         (home, repositories, intermediate, project)

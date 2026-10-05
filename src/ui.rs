@@ -289,8 +289,8 @@ mod tests {
         state.repositories = vec![Repository {
             path: repository.clone(),
             projects: vec![
-                Project { path: repository.clone(), kinds: vec![ProjectKind::Git] },
-                Project { path: repository.join("library"), kinds: vec![ProjectKind::Rust] },
+                Project::new(repository.clone(), vec![ProjectKind::Git], None),
+                Project::new(repository.join("library"), vec![ProjectKind::Rust], None),
             ],
         }];
         state.expanded.insert(state.home.clone());
@@ -310,9 +310,12 @@ mod tests {
     fn project_list_scrolls_before_selection_reaches_the_bottom() {
         let mut state = test_state();
         let projects: Vec<_> = (0..20)
-            .map(|index| Project {
-                path: state.home.join(format!("project-{index:02}")),
-                kinds: vec![ProjectKind::Git],
+            .map(|index| {
+                Project::new(
+                    state.home.join(format!("project-{index:02}")),
+                    vec![ProjectKind::Git],
+                    None,
+                )
             })
             .collect();
         state.repositories = vec![Repository { path: state.home.clone(), projects }];
