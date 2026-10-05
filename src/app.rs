@@ -1,7 +1,10 @@
 use crate::{
     action::Action,
-    backend::sessions::{Session, SessionBackend},
     backend::{Project, ProjectKind, Repository, git::GitStatus},
+    backend::{
+        commands::CommandKind,
+        sessions::{Session, SessionBackend},
+    },
     config::{DisplayMode, Settings},
     ui,
 };
@@ -21,34 +24,33 @@ pub enum Confirmation {
     StopSession,
 }
 
-#[derive(Clone, Copy)]
-enum CommandKind {
-    Test,
-    Lint,
-}
-
-impl CommandKind {
-    fn title(self) -> &'static str {
-        match self {
-            Self::Test => "Test",
-            Self::Lint => "Lint",
-        }
-    }
-
-    fn recipe(self) -> &'static str {
-        match self {
-            Self::Test => "test",
-            Self::Lint => "lint",
-        }
-    }
-}
-
 pub struct CommandPopup {
     pub title: String,
     pub output: String,
     pub scroll: u16,
     pub follow: bool,
     pub success: Option<bool>,
+}
+
+impl CommandPopup {
+    fn bottom_offset(&self) -> u16 {
+        self.output.lines().count().saturating_sub(18).min(u16::MAX as usize) as u16
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.scroll = self.bottom_offset();
+    }
+
+    fn scroll(&mut self, delta: i16) {
+        if delta.is_negative() {
+            self.scroll = self.scroll.saturating_sub(delta.unsigned_abs());
+            self.follow = false;
+        } else {
+            let bottom = self.bottom_offset();
+            self.scroll = self.scroll.saturating_add(delta as u16).min(bottom);
+            self.follow = self.scroll == bottom;
+        }
+    }
 }
 
 pub struct AppState {
@@ -78,7 +80,7 @@ pub struct AppState {
     pub sessions_refresh_pending: bool,
 }
 impl AppState {
-    /// Creates application state with the discovered tree expanded.
+    /// Creates application state using the configured tree display modes.
     pub fn new(
         home: PathBuf,
         repositories: Vec<Repository>,
@@ -86,17 +88,12 @@ impl AppState {
         settings: Settings,
         settings_error: Option<String>,
     ) -> Self {
-        let expanded = initial_expanded(&home, &repositories, &settings);
-        let selected = rows(&home, &repositories, &expanded, &settings, false)
-            .first()
-            .map(|r| r.path.clone())
-            .unwrap_or_else(|| home.clone());
-        Self {
+        let mut state = Self {
+            selected: home.clone(),
             repositories,
             home,
-            selected,
             project_list_state: ListState::default(),
-            expanded,
+            expanded: HashSet::new(),
             show_hidden: false,
             settings,
             error_popup: settings_error,
@@ -116,202 +113,466 @@ impl AppState {
             git_status_generation: 0,
             sessions_refresh_generation: 0,
             sessions_refresh_pending: false,
-        }
+        };
+        state.expanded = state.initially_expanded_directories();
+        state.selected = state
+            .visible_rows()
+            .first()
+            .map(|row| row.path.clone())
+            .unwrap_or_else(|| state.home.clone());
+        state
     }
-}
-/// Runs the application event loop until the user quits.
-pub async fn run(
-    t: &mut DefaultTerminal,
-    rx: &mut Receiver<Action>,
-    tx: Sender<Action>,
-    mut s: AppState,
-) -> color_eyre::Result<()> {
-    request_git_status(&mut s, tx.clone());
-    let mut tick = time::interval(Duration::from_millis(150));
-    let mut sessions_tick = time::interval(Duration::from_secs(1));
-    sessions_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    sessions_tick.tick().await;
-    loop {
-        t.draw(|f| ui::draw(f, &mut s))?;
-        tokio::select! {
-            action = rx.recv() => if s.error_popup.is_some() {
-                match action {
-                    Some(Action::Quit | Action::Cancel | Action::Open) => s.error_popup = None,
-                    Some(action) => { let _ = handle_background_action(&mut s, action, tx.clone()); }
-                    None => break,
-                }
-            } else { match (s.command_popup.as_ref(), action) {
-                (None, Some(action)) => match action {
-                    Action::Quit => break,
-                    Action::Up => {
-                        select(&mut s, -1);
-                        request_git_status(&mut s, tx.clone());
+    /// Runs the application event loop until the user quits.
+    pub async fn run(
+        mut self,
+        terminal: &mut DefaultTerminal,
+        rx: &mut Receiver<Action>,
+        tx: Sender<Action>,
+    ) -> color_eyre::Result<()> {
+        self.request_git_status(tx.clone());
+        let mut tick = time::interval(Duration::from_millis(150));
+        let mut sessions_tick = time::interval(Duration::from_secs(1));
+        sessions_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        sessions_tick.tick().await;
+        loop {
+            terminal.draw(|f| ui::draw(f, &mut self))?;
+            tokio::select! {
+                action = rx.recv() => if self.error_popup.is_some() {
+                    match action {
+                        Some(Action::Quit | Action::Cancel | Action::Open) => self.error_popup = None,
+                        Some(action) => { let _ = self.handle_background_action(action, tx.clone()); }
+                        None => break,
                     }
-                    Action::Down => {
-                        select(&mut s, 1);
-                        request_git_status(&mut s, tx.clone());
-                    }
-                    Action::Left => {
-                        if has_child(&s) { s.expanded.remove(&s.selected); }
-                    }
-                    Action::Right => {
-                        if has_child(&s) { s.expanded.insert(s.selected.clone()); }
-                    }
-                    Action::ToggleHidden => toggle_hidden(&mut s, tx.clone()),
-                    Action::Open => activate(&mut s),
-                    Action::Start => start(&mut s),
-                    Action::Stop => request_stop(&mut s),
-                    Action::Confirm => match s.confirmation.take() {
-                        Some(Confirmation::StopSession) => stop(&mut s),
-                        None => {}
-                    },
-                    Action::Cancel => {
-                        s.confirmation = None;
-                        s.status.clear();
-                    }
-                    Action::Test => run_command(&mut s, CommandKind::Test, tx.clone()),
-                    Action::Lint => run_command(&mut s, CommandKind::Lint, tx.clone()),
-                    Action::Refresh => refresh_projects(&mut s, tx.clone()),
-                    action => { let _ = handle_background_action(&mut s, action, tx.clone()); }
-                },
-                (Some(_), Some(action)) => match action {
-                    Action::Quit | Action::Cancel => {
-                        s.command_popup = None;
-                        s.command_generation += 1;
-                        s.confirmation = None;
-                        s.status.clear();
-                    }
-                    Action::Up => scroll_popup(&mut s, -1),
-                    Action::Down => scroll_popup(&mut s, 1),
-                    action => { let _ = handle_background_action(&mut s, action, tx.clone()); }
-                },
-                (_, None) => break,
-            }},
-            _ = sessions_tick.tick() => refresh_sessions_background(&mut s, tx.clone()),
-            _ = tick.tick(), if s.loading => s.spinner = (s.spinner + 1) % 6,
-        }
-    }
-    Ok(())
-}
-
-/// Handles asynchronous events that can arrive with or without an open popup.
-fn handle_background_action(
-    state: &mut AppState,
-    action: Action,
-    tx: Sender<Action>,
-) -> Result<(), Action> {
-    match action {
-        Action::Resize => {}
-        Action::CommandFinished { generation, title, output, success } => {
-            if generation == state.command_generation {
-                if let Some(popup) = state.command_popup.as_mut() {
-                    popup.title = title;
-                    popup.output = output;
-                    popup.success = Some(success);
-                    if popup.follow {
-                        popup.scroll = bottom_scroll(&popup.output);
-                    }
-                } else {
-                    state.command_popup = Some(CommandPopup {
-                        title,
-                        output,
-                        scroll: 0,
-                        follow: true,
-                        success: Some(success),
-                    });
-                }
-            }
-        }
-        Action::CommandOutput { generation, output } => {
-            if generation == state.command_generation
-                && let Some(popup) = state.command_popup.as_mut()
-            {
-                popup.output.push_str(&output);
-                if popup.follow {
-                    popup.scroll = bottom_scroll(&popup.output);
-                }
-            }
-        }
-        Action::GitStatusLoaded { generation, path, result } => {
-            if generation == state.git_status_generation && path == state.selected {
-                state.git_status_loading = false;
-                if let Ok(status) = result {
-                    state.git_status_cache.insert(path, status.clone());
-                    state.git_status = Some(status);
-                }
-            }
-        }
-        Action::SessionsLoaded { generation, result } => {
-            if generation == state.sessions_refresh_generation {
-                state.sessions_refresh_pending = false;
-                if let Ok(sessions) = result
-                    && sessions != state.sessions
-                {
-                    state.sessions = sessions;
-                }
-            }
-        }
-        Action::ProjectsLoaded { generation, result } => {
-            if generation == state.project_scan_generation {
-                match result {
-                    Ok(repositories) => {
-                        let previously_expanded = state.expanded.clone();
-                        state.repositories = repositories;
-                        let available = all_dirs(&state.home, &state.repositories);
-                        state.expanded = previously_expanded
-                            .into_iter()
-                            .filter(|path| available.contains(path))
-                            .collect();
-                        state.expanded.insert(state.home.clone());
-                        let visible = rows(
-                            &state.home,
-                            &state.repositories,
-                            &state.expanded,
-                            &state.settings,
-                            state.show_hidden,
-                        );
-                        if !visible.iter().any(|row| row.path == state.selected) {
-                            state.selected = visible
-                                .first()
-                                .map(|row| row.path.clone())
-                                .unwrap_or_else(|| state.home.clone());
+                } else { match (self.command_popup.as_ref(), action) {
+                    (None, Some(action)) => match action {
+                        Action::Quit => break,
+                        Action::Up => {
+                            self.move_selection(-1);
+                            self.request_git_status(tx.clone());
                         }
-                        request_git_status(state, tx.clone());
-                        state.status = "Projects refreshed".into();
+                        Action::Down => {
+                            self.move_selection(1);
+                            self.request_git_status(tx.clone());
+                        }
+                        Action::Left => {
+                            if self.selected_has_children() { self.expanded.remove(&self.selected); }
+                        }
+                        Action::Right => {
+                            if self.selected_has_children() { self.expanded.insert(self.selected.clone()); }
+                        }
+                        Action::ToggleHidden => self.toggle_hidden(tx.clone()),
+                        Action::Open => self.activate_session(),
+                        Action::Start => self.start_session(),
+                        Action::Stop => self.request_stop_session(),
+                        Action::Confirm => match self.confirmation.take() {
+                            Some(Confirmation::StopSession) => self.stop_session(),
+                            None => {}
+                        },
+                        Action::Cancel => {
+                            self.confirmation = None;
+                            self.status.clear();
+                        }
+                        Action::Test => self.run_command(CommandKind::Test, tx.clone()),
+                        Action::Lint => self.run_command(CommandKind::Lint, tx.clone()),
+                        Action::Refresh => self.request_project_scan(tx.clone()),
+                        action => { let _ = self.handle_background_action(action, tx.clone()); }
+                    },
+                    (Some(_), Some(action)) => match action {
+                        Action::Quit | Action::Cancel => {
+                            self.command_popup = None;
+                            self.command_generation += 1;
+                            self.confirmation = None;
+                            self.status.clear();
+                        }
+                        Action::Up => if let Some(popup) = self.command_popup.as_mut() { popup.scroll(-1); },
+                        Action::Down => if let Some(popup) = self.command_popup.as_mut() { popup.scroll(1); },
+                        action => { let _ = self.handle_background_action(action, tx.clone()); }
+                    },
+                    (_, None) => break,
+                }},
+                _ = sessions_tick.tick() => self.request_sessions_refresh(tx.clone()),
+                _ = tick.tick(), if self.loading => self.spinner = (self.spinner + 1) % 6,
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles asynchronous events that can arrive with or without an open popup.
+    fn handle_background_action(
+        &mut self,
+        action: Action,
+        tx: Sender<Action>,
+    ) -> Result<(), Action> {
+        match action {
+            Action::Resize => {}
+            Action::CommandFinished { generation, title, output, success } => {
+                if generation == self.command_generation {
+                    if let Some(popup) = self.command_popup.as_mut() {
+                        popup.title = title;
+                        popup.output = output;
+                        popup.success = Some(success);
+                        if popup.follow {
+                            popup.scroll_to_bottom();
+                        }
+                    } else {
+                        self.command_popup = Some(CommandPopup {
+                            title,
+                            output,
+                            scroll: 0,
+                            follow: true,
+                            success: Some(success),
+                        });
                     }
-                    Err(error) => state.status = format!("Project scan failed: {error}"),
+                }
+            }
+            Action::CommandOutput { generation, output } => {
+                if generation == self.command_generation
+                    && let Some(popup) = self.command_popup.as_mut()
+                {
+                    popup.output.push_str(&output);
+                    if popup.follow {
+                        popup.scroll_to_bottom();
+                    }
+                }
+            }
+            Action::GitStatusLoaded { generation, path, result } => {
+                if generation == self.git_status_generation && path == self.selected {
+                    self.git_status_loading = false;
+                    if let Ok(status) = result {
+                        self.git_status_cache.insert(path, status.clone());
+                        self.git_status = Some(status);
+                    }
+                }
+            }
+            Action::SessionsLoaded { generation, result } => {
+                if generation == self.sessions_refresh_generation {
+                    self.sessions_refresh_pending = false;
+                    if let Ok(sessions) = result
+                        && sessions != self.sessions
+                    {
+                        self.sessions = sessions;
+                    }
+                }
+            }
+            Action::ProjectsLoaded { generation, result } => {
+                if generation == self.project_scan_generation {
+                    match result {
+                        Ok(repositories) => {
+                            let previously_expanded = self.expanded.clone();
+                            self.repositories = repositories;
+                            let available = self.tree_directories();
+                            self.expanded = previously_expanded
+                                .into_iter()
+                                .filter(|path| available.contains(path))
+                                .collect();
+                            self.expanded.insert(self.home.clone());
+                            let visible = self.visible_rows();
+                            if !visible.iter().any(|row| row.path == self.selected) {
+                                self.selected = visible
+                                    .first()
+                                    .map(|row| row.path.clone())
+                                    .unwrap_or_else(|| self.home.clone());
+                            }
+                            self.request_git_status(tx.clone());
+                            self.status = "Projects refreshed".into();
+                        }
+                        Err(error) => self.status = format!("Project scan failed: {error}"),
+                    }
+                }
+            }
+            Action::Wait => {
+                self.loading = true;
+                tokio::spawn(wait(tx));
+            }
+            Action::Done => {
+                self.loading = false;
+                self.completed += 1;
+            }
+            action => return Err(action),
+        }
+        Ok(())
+    }
+
+    /// Starts a background scan of the project tree.
+    fn request_project_scan(&mut self, tx: Sender<Action>) {
+        self.project_scan_generation += 1;
+        let generation = self.project_scan_generation;
+        let home = self.home.clone();
+        let skipped_dirs = self.settings.skipped_dirs.clone();
+        tokio::spawn(async move {
+            let result =
+                tokio::task::spawn_blocking(move || Repository::discover(&home, &skipped_dirs))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = tx.send(Action::ProjectsLoaded { generation, result }).await;
+        });
+        self.status = "Scanning projects...".into();
+    }
+
+    fn refresh_sessions(&mut self) {
+        self.sessions_refresh_generation += 1;
+        self.sessions_refresh_pending = false;
+        match self.session_backend.list() {
+            Ok(sessions) if sessions != self.sessions => self.sessions = sessions,
+            Ok(_) => {}
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    /// Refreshes tmux sessions without blocking the application event loop.
+    fn request_sessions_refresh(&mut self, tx: Sender<Action>) {
+        if self.sessions_refresh_pending {
+            return;
+        }
+        self.sessions_refresh_generation += 1;
+        self.sessions_refresh_pending = true;
+        let generation = self.sessions_refresh_generation;
+        let backend = self.session_backend.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                backend.list().map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            let _ = tx.send(Action::SessionsLoaded { generation, result }).await;
+        });
+    }
+
+    fn request_git_status(&mut self, tx: Sender<Action>) {
+        self.git_status_generation += 1;
+        let generation = self.git_status_generation;
+        let path = self.selected.clone();
+        if self.project_at(&path).is_none() {
+            self.git_status = None;
+            self.git_status_loading = false;
+            return;
+        }
+        let cached = self.git_status_cache.get(&path).cloned();
+        self.git_status = cached.clone();
+        self.git_status_loading = cached.is_none();
+        let load_path = path.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || GitStatus::load(&load_path))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            let _ = tx.send(Action::GitStatusLoaded { generation, path, result }).await;
+        });
+    }
+
+    fn selected_session_name(&self) -> Option<String> {
+        if self.selected_project().is_some() {
+            Some(Session::name_for_path(&self.selected))
+        } else {
+            None
+        }
+    }
+
+    fn start_session(&mut self) {
+        if let Some(name) = self.selected_session_name() {
+            let editor = self.settings.editor_for(&self.selected);
+            let agent = self.settings.agent_for(&self.selected);
+            match self.session_backend.create(&self.selected, editor, agent) {
+                Ok(_) => {
+                    self.refresh_sessions();
+                    self.status = format!("Started {name}");
+                }
+                Err(error) => self.status = error.to_string(),
+            }
+        }
+    }
+
+    fn activate_session(&mut self) {
+        if let Some(name) = self.selected_session_name() {
+            let editor = self.settings.editor_for(&self.selected);
+            let agent = self.settings.agent_for(&self.selected);
+            let result = if self.sessions.iter().any(|session| session.name == name) {
+                self.session_backend.switch_to(&name)
+            } else {
+                self.session_backend
+                    .create(&self.selected, editor, agent)
+                    .and_then(|_| self.session_backend.switch_to(&name))
+            };
+            match result {
+                Ok(()) => self.status = format!("Switched to {name}"),
+                Err(error) => self.status = error.to_string(),
+            }
+            self.refresh_sessions();
+        }
+    }
+
+    fn request_stop_session(&mut self) {
+        if self
+            .selected_session_name()
+            .and_then(|name| {
+                self.sessions.iter().find(|session| session.name == name).map(|_| name)
+            })
+            .is_some()
+        {
+            self.confirmation = Some(Confirmation::StopSession);
+            self.status = "Stop session? y/n".into();
+        }
+    }
+
+    fn stop_session(&mut self) {
+        if let Some(name) = self.selected_session_name() {
+            match self.session_backend.stop(&name) {
+                Ok(()) => {
+                    self.refresh_sessions();
+                    self.status = format!("Stopped {name}");
+                }
+                Err(error) => self.status = error.to_string(),
+            }
+        }
+        self.confirmation = None;
+    }
+
+    fn run_command(&mut self, command: CommandKind, tx: Sender<Action>) {
+        let Some(project) = self.selected_project() else {
+            return;
+        };
+        let project = project.clone();
+        let title = command.title().to_string();
+        self.command_generation += 1;
+        let generation = self.command_generation;
+        self.command_popup = Some(CommandPopup {
+            title: title.clone(),
+            output: "Running...\n".into(),
+            scroll: 0,
+            follow: true,
+            success: None,
+        });
+        let output_tx = tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                execute_commands_streaming(&project, command, generation, output_tx)
+            })
+            .await
+            .unwrap_or_else(|error| (format!("Command task failed: {error}"), false));
+            let _ = tx
+                .send(Action::CommandFinished {
+                    generation,
+                    title,
+                    output: result.0,
+                    success: result.1,
+                })
+                .await;
+        });
+    }
+
+    /// Reports whether the selected directory contains a discovered project below it.
+    fn selected_has_children(&self) -> bool {
+        self.repositories
+            .iter()
+            .flat_map(|r| &r.projects)
+            .any(|p| p.path != self.selected && p.path.starts_with(&self.selected))
+    }
+
+    /// Moves selection through the currently visible tree rows.
+    fn move_selection(&mut self, delta: i32) {
+        let rows = self.visible_rows();
+        if let Some(index) = rows.iter().position(|row| row.path == self.selected) {
+            let next = (index as i32 + delta).clamp(0, rows.len() as i32 - 1) as usize;
+            self.selected = rows[next].path.clone();
+        }
+    }
+
+    fn toggle_hidden(&mut self, tx: Sender<Action>) {
+        self.show_hidden = !self.show_hidden;
+        let visible = self.visible_rows();
+        if !visible.iter().any(|row| row.path == self.selected) {
+            let mut ancestor = self.selected.parent();
+            self.selected = std::iter::from_fn(|| {
+                let path = ancestor?;
+                ancestor = path.parent();
+                Some(path.to_path_buf())
+            })
+            .find(|path| visible.iter().any(|row| row.path == *path))
+            .or_else(|| visible.first().map(|row| row.path.clone()))
+            .unwrap_or_else(|| self.home.clone());
+            self.request_git_status(tx);
+        }
+    }
+
+    /// Produces the currently visible rows of the project tree.
+    pub fn visible_rows(&self) -> Vec<Row> {
+        let home = self.home.as_path();
+        let set: BTreeSet<_> = self.tree_directories().into_iter().collect();
+        set.into_iter()
+            .filter_map(|p| {
+                if p == home {
+                    return None;
+                }
+                let is_hidden = self.settings.display_for(&p) == DisplayMode::Hidden;
+                let has_hidden_ancestor = p
+                    .ancestors()
+                    .take_while(|ancestor| *ancestor != home)
+                    .any(|ancestor| self.settings.display_for(ancestor) == DisplayMode::Hidden);
+                if !self.show_hidden && (is_hidden || has_hidden_ancestor) {
+                    return None;
+                }
+                if p != home
+                    && !p
+                        .ancestors()
+                        .skip(1)
+                        .all(|a| !a.starts_with(home) || self.expanded.contains(a))
+                {
+                    return None;
+                }
+                let depth = p
+                    .strip_prefix(home)
+                    .map(|x| x.components().count())
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                Some(Row {
+                    path: p.clone(),
+                    depth,
+                    kinds: self.project_at(&p).map(|x| x.kinds.clone()),
+                    hidden: is_hidden,
+                })
+            })
+            .collect()
+    }
+
+    /// Finds the project metadata associated with a path.
+    fn project_at(&self, path: &Path) -> Option<&Project> {
+        self.repositories
+            .iter()
+            .flat_map(|repo| &repo.projects)
+            .find(|project| project.path == path)
+    }
+
+    fn selected_project(&self) -> Option<&Project> {
+        self.project_at(&self.selected)
+    }
+
+    /// Collects every directory needed to render the project tree.
+    fn tree_directories(&self) -> HashSet<PathBuf> {
+        let mut directories = HashSet::new();
+        for project in self.repositories.iter().flat_map(|repo| &repo.projects) {
+            for path in project.path.ancestors().take_while(|path| path.starts_with(&self.home)) {
+                directories.insert(path.to_path_buf());
+            }
+        }
+        directories
+    }
+
+    fn initially_expanded_directories(&self) -> HashSet<PathBuf> {
+        let mut expanded = self.tree_directories();
+        for path in expanded.clone() {
+            match self.settings.display_for(&path) {
+                DisplayMode::Hidden | DisplayMode::Expanded => {
+                    expanded.insert(path);
+                }
+                DisplayMode::Collapsed => {
+                    expanded.remove(&path);
                 }
             }
         }
-        Action::Wait => {
-            state.loading = true;
-            tokio::spawn(wait(tx));
-        }
-        Action::Done => {
-            state.loading = false;
-            state.completed += 1;
-        }
-        action => return Err(action),
+        expanded
     }
-    Ok(())
-}
-
-/// Starts a background scan of the project tree.
-fn refresh_projects(state: &mut AppState, tx: Sender<Action>) {
-    state.project_scan_generation += 1;
-    let generation = state.project_scan_generation;
-    let home = state.home.clone();
-    let skipped_dirs = state.settings.skipped_dirs.clone();
-    tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            crate::backend::discover_repositories_with_skipped_dirs(&home, &skipped_dirs)
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result.map_err(|error| error.to_string()));
-        let _ = tx.send(Action::ProjectsLoaded { generation, result }).await;
-    });
-    state.status = "Scanning projects...".into();
 }
 
 /// Sends a completion action after the demonstration delay.
@@ -320,211 +581,13 @@ async fn wait(tx: Sender<Action>) {
     let _ = tx.send(Action::Done).await;
 }
 
-fn refresh_sessions(state: &mut AppState) {
-    state.sessions_refresh_generation += 1;
-    state.sessions_refresh_pending = false;
-    match state.session_backend.list() {
-        Ok(sessions) if sessions != state.sessions => state.sessions = sessions,
-        Ok(_) => {}
-        Err(error) => state.status = error.to_string(),
-    }
-}
-
-/// Refreshes tmux sessions without blocking the application event loop.
-fn refresh_sessions_background(state: &mut AppState, tx: Sender<Action>) {
-    if state.sessions_refresh_pending {
-        return;
-    }
-    state.sessions_refresh_generation += 1;
-    state.sessions_refresh_pending = true;
-    let generation = state.sessions_refresh_generation;
-    let backend = state.session_backend.clone();
-    tokio::spawn(async move {
-        let result =
-            tokio::task::spawn_blocking(move || backend.list().map_err(|error| error.to_string()))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-        let _ = tx.send(Action::SessionsLoaded { generation, result }).await;
-    });
-}
-
-fn request_git_status(state: &mut AppState, tx: Sender<Action>) {
-    state.git_status_generation += 1;
-    let generation = state.git_status_generation;
-    let path = state.selected.clone();
-    if project(&state.repositories, &path).is_none() {
-        state.git_status = None;
-        state.git_status_loading = false;
-        return;
-    }
-    let cached = state.git_status_cache.get(&path).cloned();
-    state.git_status = cached.clone();
-    state.git_status_loading = cached.is_none();
-    let load_path = path.clone();
-    tokio::spawn(async move {
-        let result =
-            tokio::task::spawn_blocking(move || crate::backend::git::load_status(&load_path))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-        let _ = tx.send(Action::GitStatusLoaded { generation, path, result }).await;
-    });
-}
-
-fn session_name(state: &AppState) -> Option<String> {
-    if project(&state.repositories, &state.selected).is_some() {
-        Some(crate::backend::sessions::session_name(&state.selected))
-    } else {
-        None
-    }
-}
-fn start(state: &mut AppState) {
-    if let Some(name) = session_name(state) {
-        let editor = state.settings.editor_for(&state.selected);
-        let agent = state.settings.agent_for(&state.selected);
-        match state.session_backend.create(&state.selected, editor, agent) {
-            Ok(_) => {
-                refresh_sessions(state);
-                state.status = format!("Started {name}");
-            }
-            Err(error) => state.status = error.to_string(),
-        }
-    }
-}
-fn activate(state: &mut AppState) {
-    if let Some(name) = session_name(state) {
-        let editor = state.settings.editor_for(&state.selected);
-        let agent = state.settings.agent_for(&state.selected);
-        let result = if state.sessions.iter().any(|session| session.name == name) {
-            state.session_backend.switch_to(&name)
-        } else {
-            state
-                .session_backend
-                .create(&state.selected, editor, agent)
-                .and_then(|_| state.session_backend.switch_to(&name))
-        };
-        match result {
-            Ok(()) => state.status = format!("Switched to {name}"),
-            Err(error) => state.status = error.to_string(),
-        }
-        refresh_sessions(state);
-    }
-}
-fn request_stop(state: &mut AppState) {
-    if session_name(state)
-        .and_then(|name| state.sessions.iter().find(|session| session.name == name).map(|_| name))
-        .is_some()
-    {
-        state.confirmation = Some(Confirmation::StopSession);
-        state.status = "Stop session? y/n".into();
-    }
-}
-fn stop(state: &mut AppState) {
-    if let Some(name) = session_name(state) {
-        match state.session_backend.stop(&name) {
-            Ok(()) => {
-                refresh_sessions(state);
-                state.status = format!("Stopped {name}");
-            }
-            Err(error) => state.status = error.to_string(),
-        }
-    }
-    state.confirmation = None;
-}
-
-fn run_command(state: &mut AppState, command: CommandKind, tx: Sender<Action>) {
-    let Some(project) = project(&state.repositories, &state.selected) else {
-        return;
-    };
-    let path = project.path.clone();
-    let kinds = project.kinds.clone();
-    let title = command.title().to_string();
-    state.command_generation += 1;
-    let generation = state.command_generation;
-    state.command_popup = Some(CommandPopup {
-        title: title.clone(),
-        output: "Running...\n".into(),
-        scroll: 0,
-        follow: true,
-        success: None,
-    });
-    let output_tx = tx.clone();
-    tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            execute_commands_streaming(&path, &kinds, command, generation, output_tx)
-        })
-        .await
-        .unwrap_or_else(|error| (format!("Command task failed: {error}"), false));
-        let _ = tx
-            .send(Action::CommandFinished {
-                generation,
-                title,
-                output: result.0,
-                success: result.1,
-            })
-            .await;
-    });
-}
-
-fn scroll_popup(state: &mut AppState, delta: i16) {
-    if let Some(popup) = state.command_popup.as_mut() {
-        if delta.is_negative() {
-            popup.scroll = popup.scroll.saturating_sub(delta.unsigned_abs());
-            popup.follow = false;
-        } else {
-            let bottom = bottom_scroll(&popup.output);
-            popup.scroll = popup.scroll.saturating_add(delta as u16).min(bottom);
-            popup.follow = popup.scroll == bottom;
-        }
-    }
-}
-
-fn bottom_scroll(output: &str) -> u16 {
-    output.lines().count().saturating_sub(18).min(u16::MAX as usize) as u16
-}
-
-fn project_commands(
-    path: &Path,
-    kinds: &[ProjectKind],
-    command: CommandKind,
-) -> Vec<Vec<&'static str>> {
-    let declaration = format!("{}:", command.recipe());
-    let has_recipe = std::fs::read_to_string(path.join("justfile"))
-        .is_ok_and(|contents| contents.lines().any(|line| line.starts_with(&declaration)));
-    if has_recipe {
-        return vec![vec!["just", command.recipe()]];
-    }
-
-    let (python, rust) = match command {
-        CommandKind::Test => (vec![vec!["uv", "run", "pytest"]], vec![vec!["cargo", "test"]]),
-        CommandKind::Lint => (
-            vec![
-                vec!["uv", "run", "ruff", "format", "--check"],
-                vec!["uv", "run", "ruff", "check"],
-            ],
-            vec![vec!["cargo", "fmt", "--check"], vec!["cargo", "clippy"]],
-        ),
-    };
-
-    let mut commands = Vec::new();
-    if kinds.contains(&ProjectKind::Python) {
-        commands.extend(python);
-    }
-    if kinds.contains(&ProjectKind::Rust) {
-        commands.extend(rust);
-    }
-    commands
-}
-
 fn execute_commands_streaming(
-    path: &Path,
-    kinds: &[ProjectKind],
+    project: &Project,
     command: CommandKind,
     generation: u64,
     tx: Sender<Action>,
 ) -> (String, bool) {
-    let commands = project_commands(path, kinds, command);
+    let commands = project.commands(command);
     if commands.is_empty() {
         return ("No test or lint command is defined for this project.".into(), false);
     }
@@ -534,7 +597,7 @@ fn execute_commands_streaming(
         let header = format!("$ {}\n", command.join(" "));
         output.push_str(&header);
         let _ = tx.blocking_send(Action::CommandOutput { generation, output: header });
-        match execute_command_in_pty(path, &command, generation, &tx) {
+        match execute_command_in_pty(&project.path, &command, generation, &tx) {
             Ok((command_output, command_success)) => {
                 output.push_str(&command_output);
                 success &= command_success;
@@ -589,232 +652,10 @@ pub struct Row {
     pub hidden: bool,
 }
 
-/// Produces the visible filesystem-tree rows for the discovered projects.
-pub fn rows(
-    home: &Path,
-    repos: &[Repository],
-    expanded: &HashSet<PathBuf>,
-    settings: &Settings,
-    show_hidden: bool,
-) -> Vec<Row> {
-    let mut set = BTreeSet::new();
-    for r in repos {
-        for p in &r.projects {
-            let mut x = p.path.clone();
-            while x.starts_with(home) {
-                set.insert(x.clone());
-                if x == home {
-                    break;
-                }
-                let Some(y) = x.parent() else { break };
-                x = y.to_path_buf()
-            }
-        }
-    }
-    set.into_iter()
-        .filter_map(|p| {
-            if p == home {
-                return None;
-            }
-            let is_hidden = settings.display_for(&p) == DisplayMode::Hidden;
-            let has_hidden_ancestor = p
-                .ancestors()
-                .take_while(|ancestor| *ancestor != home)
-                .any(|ancestor| settings.display_for(ancestor) == DisplayMode::Hidden);
-            if !show_hidden && (is_hidden || has_hidden_ancestor) {
-                return None;
-            }
-            if p != home
-                && !p.ancestors().skip(1).all(|a| !a.starts_with(home) || expanded.contains(a))
-            {
-                return None;
-            }
-            let depth =
-                p.strip_prefix(home).map(|x| x.components().count()).unwrap_or(1).saturating_sub(1);
-            Some(Row {
-                path: p.clone(),
-                depth,
-                kinds: project(repos, &p).map(|x| x.kinds.clone()),
-                hidden: is_hidden,
-            })
-        })
-        .collect()
-}
-
-/// Returns the display label for a project kind.
-pub fn kind(k: &ProjectKind) -> &'static str {
-    match k {
-        ProjectKind::Git => "Git",
-        ProjectKind::Python => "Python",
-        ProjectKind::Rust => "Rust",
-    }
-}
-
-/// Finds the project metadata associated with a path.
-fn project<'a>(r: &'a [Repository], p: &Path) -> Option<&'a Project> {
-    r.iter().flat_map(|x| &x.projects).find(|x| x.path == p)
-}
-
-/// Reports whether the selected directory contains a discovered project below it.
-fn has_child(s: &AppState) -> bool {
-    s.repositories
-        .iter()
-        .flat_map(|r| &r.projects)
-        .any(|p| p.path != s.selected && p.path.starts_with(&s.selected))
-}
-
-/// Moves selection through the currently visible tree rows.
-fn select(s: &mut AppState, d: i32) {
-    let r = rows(&s.home, &s.repositories, &s.expanded, &s.settings, s.show_hidden);
-    if let Some(i) = r.iter().position(|x| x.path == s.selected) {
-        s.selected = r[(i as i32 + d).clamp(0, r.len() as i32 - 1) as usize].path.clone()
-    }
-}
-
-/// Collects every directory needed to render the project tree.
-fn all_dirs(h: &Path, r: &[Repository]) -> HashSet<PathBuf> {
-    let mut s = HashSet::new();
-    for x in r.iter().flat_map(|r| &r.projects) {
-        let mut p = x.path.clone();
-        while p.starts_with(h) {
-            s.insert(p.clone());
-            if p == h {
-                break;
-            }
-            let Some(q) = p.parent() else { break };
-            p = q.to_path_buf()
-        }
-    }
-    s
-}
-
-fn initial_expanded(
-    home: &Path,
-    repositories: &[Repository],
-    settings: &Settings,
-) -> HashSet<PathBuf> {
-    let mut expanded = all_dirs(home, repositories);
-    for path in expanded.clone() {
-        match settings.display_for(&path) {
-            DisplayMode::Hidden | DisplayMode::Expanded => {
-                expanded.insert(path);
-            }
-            DisplayMode::Collapsed => {
-                expanded.remove(&path);
-            }
-        }
-    }
-    expanded
-}
-
-fn toggle_hidden(state: &mut AppState, tx: Sender<Action>) {
-    state.show_hidden = !state.show_hidden;
-    let visible =
-        rows(&state.home, &state.repositories, &state.expanded, &state.settings, state.show_hidden);
-    if !visible.iter().any(|row| row.path == state.selected) {
-        let mut ancestor = state.selected.parent();
-        state.selected = std::iter::from_fn(|| {
-            let path = ancestor?;
-            ancestor = path.parent();
-            Some(path.to_path_buf())
-        })
-        .find(|path| visible.iter().any(|row| row.path == *path))
-        .or_else(|| visible.first().map(|row| row.path.clone()))
-        .unwrap_or_else(|| state.home.clone());
-        request_git_status(state, tx);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::DirectoryOverride;
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    struct TempProject(PathBuf);
-
-    impl TempProject {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "canopy-commands-test-{}",
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempProject {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn language_commands_keep_the_existing_defaults() {
-        let project = TempProject::new();
-        let kinds = [ProjectKind::Git, ProjectKind::Python, ProjectKind::Rust];
-        assert_eq!(
-            project_commands(&project.0, &kinds, CommandKind::Test),
-            vec![vec!["uv", "run", "pytest"], vec!["cargo", "test"]]
-        );
-        assert_eq!(
-            project_commands(&project.0, &kinds, CommandKind::Lint),
-            vec![
-                vec!["uv", "run", "ruff", "format", "--check"],
-                vec!["uv", "run", "ruff", "check"],
-                vec!["cargo", "fmt", "--check"],
-                vec!["cargo", "clippy"],
-            ]
-        );
-    }
-
-    #[test]
-    fn justfile_commands_override_language_defaults_and_work_for_git_projects() {
-        let project = TempProject::new();
-        fs::write(project.0.join("justfile"), "test:\n    true\nlint:\n    true\n").unwrap();
-        for kinds in
-            [vec![ProjectKind::Git], vec![ProjectKind::Git, ProjectKind::Python, ProjectKind::Rust]]
-        {
-            assert_eq!(
-                project_commands(&project.0, &kinds, CommandKind::Test),
-                vec![vec!["just", "test"]]
-            );
-            assert_eq!(
-                project_commands(&project.0, &kinds, CommandKind::Lint),
-                vec![vec!["just", "lint"]]
-            );
-        }
-    }
-
-    #[test]
-    fn missing_just_recipe_falls_back_to_language_commands() {
-        let project = TempProject::new();
-        let kinds = [ProjectKind::Rust];
-        fs::write(project.0.join("justfile"), "test:\n    true\n# lint:\nlint-extra:\n    true\n")
-            .unwrap();
-        assert_eq!(
-            project_commands(&project.0, &kinds, CommandKind::Test),
-            vec![vec!["just", "test"]]
-        );
-        assert_eq!(
-            project_commands(&project.0, &kinds, CommandKind::Lint),
-            vec![vec!["cargo", "fmt", "--check"], vec!["cargo", "clippy"],]
-        );
-
-        fs::write(project.0.join("justfile"), "lint:\n    true\ntest-extra:\n    true\n").unwrap();
-        assert_eq!(
-            project_commands(&project.0, &kinds, CommandKind::Test),
-            vec![vec!["cargo", "test"]]
-        );
-        assert_eq!(
-            project_commands(&project.0, &kinds, CommandKind::Lint),
-            vec![vec!["just", "lint"]]
-        );
-    }
 
     fn tree() -> (PathBuf, Vec<Repository>, PathBuf, PathBuf) {
         let home = PathBuf::from("/home/test");
@@ -840,7 +681,14 @@ mod tests {
             DirectoryOverride { display: Some(DisplayMode::Collapsed), ..Default::default() },
         );
 
-        let expanded = initial_expanded(&home, &repositories, &settings);
+        let state = AppState::new(
+            home.clone(),
+            repositories,
+            SessionBackend::new("/nonexistent-canopy-test-tmux"),
+            settings,
+            None,
+        );
+        let expanded = state.expanded;
         assert!(!expanded.contains(&intermediate));
         assert!(expanded.contains(&home.join("my-repo")));
     }
@@ -853,12 +701,18 @@ mod tests {
             intermediate.clone(),
             DirectoryOverride { display: Some(DisplayMode::Hidden), ..Default::default() },
         );
-        let expanded = all_dirs(&home, &repositories);
-
-        let concealed = rows(&home, &repositories, &expanded, &settings, false);
+        let mut state = AppState::new(
+            home,
+            repositories,
+            SessionBackend::new("/nonexistent-canopy-test-tmux"),
+            settings,
+            None,
+        );
+        let concealed = state.visible_rows();
         assert!(!concealed.iter().any(|row| row.path == intermediate || row.path == project));
 
-        let revealed = rows(&home, &repositories, &expanded, &settings, true);
+        state.show_hidden = true;
+        let revealed = state.visible_rows();
         assert!(revealed.iter().any(|row| row.path == intermediate && row.hidden));
         assert!(revealed.iter().any(|row| row.path == project && !row.hidden));
     }

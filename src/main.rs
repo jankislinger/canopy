@@ -20,7 +20,7 @@ async fn main() -> color_eyre::Result<()> {
     let repositories = tokio::task::spawn_blocking({
         let home = home.clone();
         let skipped_dirs = settings.skipped_dirs.clone();
-        move || backend::discover_repositories_with_skipped_dirs(&home, &skipped_dirs)
+        move || backend::Repository::discover(&home, &skipped_dirs)
     })
     .await??;
     let mut terminal = ratatui::try_init()?;
@@ -31,19 +31,14 @@ async fn main() -> color_eyre::Result<()> {
         let shutdown = shutdown.clone();
         move || event::listen(tx, shutdown)
     });
-    let result = app::run(
-        &mut terminal,
-        &mut rx,
-        tx,
-        app::AppState::new(
-            home,
-            repositories,
-            backend::sessions::SessionBackend::default(),
-            settings,
-            settings_error,
-        ),
-    )
-    .await;
+    let state = app::AppState::new(
+        home,
+        repositories,
+        backend::sessions::SessionBackend::default(),
+        settings,
+        settings_error,
+    );
+    let result = state.run(&mut terminal, &mut rx, tx).await;
     ratatui::try_restore()?;
     shutdown.store(true, Ordering::Relaxed);
     listener.await??;

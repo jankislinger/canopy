@@ -1,6 +1,5 @@
 pub mod api;
+pub mod commands;
 pub mod git;
 pub mod sessions;
-pub use api::{
-    Project, ProjectKind, Repository, discover_repositories_with_skipped_dirs, home_dir,
-};
+pub use api::{Project, ProjectKind, Repository, home_dir};

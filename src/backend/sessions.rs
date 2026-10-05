@@ -49,7 +49,7 @@ impl SessionBackend {
             "-F",
             "#{session_name}\t#{session_attached}\t#{session_path}",
         ])?;
-        parse_session_listing(&output)
+        Session::parse_listing(&output)
     }
 
     /// Creates a detached project session rooted at `project_path`.
@@ -64,7 +64,7 @@ impl SessionBackend {
         let path = project_path.canonicalize().map_err(|error| {
             SessionError::Command(format!("cannot resolve {}: {error}", project_path.display()))
         })?;
-        let name = session_name(&path);
+        let name = Session::name_for_path(&path);
         self.command_owned(vec![
             "new-session".into(),
             "-d".into(),
@@ -137,28 +137,6 @@ impl SessionBackend {
     }
 }
 
-/// Derives a readable tmux session name from a project path.
-///
-/// A repository root is named after its directory. A project below a Git
-/// repository is named `repository/project`.
-pub fn session_name(path: &Path) -> String {
-    let project_name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-    let mut current = Some(path);
-    while let Some(directory) = current {
-        if directory.join(".git").is_dir() {
-            let repository_name =
-                directory.file_name().unwrap_or(directory.as_os_str()).to_string_lossy();
-            return if directory == path {
-                sanitize_name(&repository_name)
-            } else {
-                format!("{}/{}", sanitize_name(&repository_name), sanitize_name(&project_name))
-            };
-        }
-        current = directory.parent();
-    }
-    sanitize_name(&project_name)
-}
-
 fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|character| {
@@ -171,28 +149,53 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
-fn parse_session_listing(listing: &str) -> Result<Vec<Session>, SessionError> {
-    listing
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let mut fields = line.splitn(3, '\t');
-            let name = fields.next().ok_or_else(|| SessionError::InvalidListing(line.into()))?;
-            let attached = fields
-                .next()
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(|| SessionError::InvalidListing(line.into()))?;
-            let path = fields
-                .next()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| SessionError::InvalidListing(line.into()))?;
-            Ok(Session {
-                name: name.into(),
-                attached_clients: attached,
-                working_directory: path.into(),
+impl Session {
+    /// Derives a readable tmux session name from a project path.
+    ///
+    /// A repository root is named after its directory. A project below a Git
+    /// repository is named `repository/project`.
+    pub fn name_for_path(path: &Path) -> String {
+        let project_name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+        let mut current = Some(path);
+        while let Some(directory) = current {
+            if directory.join(".git").is_dir() {
+                let repository_name =
+                    directory.file_name().unwrap_or(directory.as_os_str()).to_string_lossy();
+                return if directory == path {
+                    sanitize_name(&repository_name)
+                } else {
+                    format!("{}/{}", sanitize_name(&repository_name), sanitize_name(&project_name))
+                };
+            }
+            current = directory.parent();
+        }
+        sanitize_name(&project_name)
+    }
+
+    fn parse_listing(listing: &str) -> Result<Vec<Self>, SessionError> {
+        listing
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let mut fields = line.splitn(3, '\t');
+                let name =
+                    fields.next().ok_or_else(|| SessionError::InvalidListing(line.into()))?;
+                let attached = fields
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or_else(|| SessionError::InvalidListing(line.into()))?;
+                let path = fields
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| SessionError::InvalidListing(line.into()))?;
+                Ok(Self {
+                    name: name.into(),
+                    attached_clients: attached,
+                    working_directory: path.into(),
+                })
             })
-        })
-        .collect()
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -204,14 +207,14 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let project = root.join("my-utils");
         std::fs::create_dir_all(&project).unwrap();
-        assert_eq!(session_name(&root), "my-monorepo");
-        assert_eq!(session_name(&project), "my-monorepo/my-utils");
+        assert_eq!(Session::name_for_path(&root), "my-monorepo");
+        assert_eq!(Session::name_for_path(&project), "my-monorepo/my-utils");
         let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn parses_session_listing() {
         let sessions =
-            parse_session_listing("editor\t1\t/home/jan/project\nidle\t0\t/home/jan/other\n")
+            Session::parse_listing("editor\t1\t/home/jan/project\nidle\t0\t/home/jan/other\n")
                 .unwrap();
         assert_eq!(
             sessions,
@@ -231,6 +234,6 @@ mod tests {
     }
     #[test]
     fn rejects_malformed_session_listing() {
-        assert!(matches!(parse_session_listing("broken"), Err(SessionError::InvalidListing(_))));
+        assert!(matches!(Session::parse_listing("broken"), Err(SessionError::InvalidListing(_))));
     }
 }

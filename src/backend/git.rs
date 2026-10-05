@@ -30,52 +30,56 @@ pub struct GitCommit {
     pub age: String,
 }
 
-/// Loads branch and recent commit information for a project or its Git parent.
-pub fn load_status(path: &Path) -> Result<GitStatus, String> {
-    let repository = path
-        .ancestors()
-        .find(|candidate| candidate.join(".git").exists())
-        .ok_or_else(|| "Not in a Git repository".to_string())?
-        .to_path_buf();
-    let branch = git(&repository, ["branch", "--show-current"])
-        .map(|branch| if branch.is_empty() { "HEAD".into() } else { branch })?;
-    let user_email = git(&repository, ["config", "--get", "user.email"]).unwrap_or_default();
-    let user_name = git(&repository, ["config", "--get", "user.name"]).unwrap_or_default();
-    let log = git(&repository, ["log", "-6", "--format=%H%x1f%an%x1f%ae%x1f%s%x1f%ar%x1e"])?;
-    let commits = parse_commits(&log, &user_email, &user_name);
-    let all_changes = git(&repository, ["status", "--porcelain=v1", "--untracked-files=all"])?;
-    let project_changes =
-        git(path, ["status", "--porcelain=v1", "--untracked-files=all", "--", "."])?;
-    let working_tree = if all_changes.is_empty() {
-        WorkingTree::Clean
-    } else if project_changes.is_empty() {
-        WorkingTree::ChangesOutsideProject
-    } else {
-        WorkingTree::ChangesInProject
-    };
-    Ok(GitStatus { repository, branch, working_tree, commits })
+impl GitStatus {
+    /// Loads branch and recent commit information for a project or its Git parent.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let repository = path
+            .ancestors()
+            .find(|candidate| candidate.join(".git").exists())
+            .ok_or_else(|| "Not in a Git repository".to_string())?
+            .to_path_buf();
+        let branch = git(&repository, ["branch", "--show-current"])
+            .map(|branch| if branch.is_empty() { "HEAD".into() } else { branch })?;
+        let user_email = git(&repository, ["config", "--get", "user.email"]).unwrap_or_default();
+        let user_name = git(&repository, ["config", "--get", "user.name"]).unwrap_or_default();
+        let log = git(&repository, ["log", "-6", "--format=%H%x1f%an%x1f%ae%x1f%s%x1f%ar%x1e"])?;
+        let commits = GitCommit::parse_log(&log, &user_email, &user_name);
+        let all_changes = git(&repository, ["status", "--porcelain=v1", "--untracked-files=all"])?;
+        let project_changes =
+            git(path, ["status", "--porcelain=v1", "--untracked-files=all", "--", "."])?;
+        let working_tree = if all_changes.is_empty() {
+            WorkingTree::Clean
+        } else if project_changes.is_empty() {
+            WorkingTree::ChangesOutsideProject
+        } else {
+            WorkingTree::ChangesInProject
+        };
+        Ok(Self { repository, branch, working_tree, commits })
+    }
 }
 
-fn parse_commits(log: &str, user_email: &str, user_name: &str) -> Vec<GitCommit> {
-    log.split('\u{1e}')
-        .filter(|entry| !entry.is_empty())
-        .filter_map(|entry| {
-            let entry = entry.trim_start();
-            let mut fields = entry.split('\u{1f}');
-            let sha = fields.next()?.get(..6)?.to_string();
-            let author_name = fields.next()?;
-            let author_email = fields.next()?;
-            let authored_by_user = if user_email.is_empty() {
-                !user_name.is_empty() && author_name.eq_ignore_ascii_case(user_name)
-            } else {
-                author_email.eq_ignore_ascii_case(user_email)
-            };
-            let author = initials(author_name);
-            let message = fields.next()?.to_string();
-            let age = fields.next()?.to_string();
-            Some(GitCommit { sha, author, authored_by_user, message, age })
-        })
-        .collect()
+impl GitCommit {
+    fn parse_log(log: &str, user_email: &str, user_name: &str) -> Vec<Self> {
+        log.split('\u{1e}')
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| {
+                let entry = entry.trim_start();
+                let mut fields = entry.split('\u{1f}');
+                let sha = fields.next()?.get(..6)?.to_string();
+                let author_name = fields.next()?;
+                let author_email = fields.next()?;
+                let authored_by_user = if user_email.is_empty() {
+                    !user_name.is_empty() && author_name.eq_ignore_ascii_case(user_name)
+                } else {
+                    author_email.eq_ignore_ascii_case(user_email)
+                };
+                let author = initials(author_name);
+                let message = fields.next()?.to_string();
+                let age = fields.next()?.to_string();
+                Some(Self { sha, author, authored_by_user, message, age })
+            })
+            .collect()
+    }
 }
 
 fn git<const N: usize>(repository: &Path, args: [&str; N]) -> Result<String, String> {
@@ -101,7 +105,7 @@ fn initials(author: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{initials, parse_commits};
+    use super::{GitCommit, initials};
 
     #[test]
     fn derives_author_initials() {
@@ -116,7 +120,7 @@ mod tests {
             "\nabcdef1234567890abcdef1234567890abcdef12\u{1f}Grace Hopper\u{1f}grace@example.com\u{1f}Second\u{1f}2 days ago\u{1e}",
         );
 
-        let commits = parse_commits(log, "jan@example.com", "Jan Example");
+        let commits = GitCommit::parse_log(log, "jan@example.com", "Jan Example");
 
         assert_eq!(commits.len(), 2);
         assert_eq!(

@@ -1,4 +1,7 @@
-use crate::app::{AppState, kind, rows};
+use crate::{
+    app::AppState,
+    backend::{ProjectKind, sessions::Session},
+};
 use ansi_to_tui::IntoText;
 use ratatui::{
     layout::{Constraint, Layout},
@@ -11,7 +14,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
     let a = Layout::vertical([Constraint::Min(8), Constraint::Length(5)]).split(f.area());
     let p =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(a[0]);
-    let rs = rows(&s.home, &s.repositories, &s.expanded, &s.settings, s.show_hidden);
+    let rs = s.visible_rows();
     let list_width = p[0].width.saturating_sub(2) as usize;
     let items = rs
         .iter()
@@ -23,13 +26,12 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
                 .any(|project| project.path != r.path && project.path.starts_with(&r.path));
             let m =
                 if child { if s.expanded.contains(&r.path) { "▾" } else { "▸" } } else { " " };
-            let k = r.kinds.as_ref().map(|x| x.iter().map(kind).collect::<Vec<_>>().join(","));
             let n = r.path.file_name().unwrap_or(r.path.as_os_str()).to_string_lossy();
             let session_status = r
                 .kinds
                 .as_ref()
                 .map(|_| {
-                    let name = crate::backend::sessions::session_name(&r.path);
+                    let name = Session::name_for_path(&r.path);
                     match s.sessions.iter().find(|session| session.name == name) {
                         Some(session) if session.attached_clients > 0 => "●  attached",
                         Some(_) => "●   running",
@@ -43,9 +45,13 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
                 "",
                 indent = r.depth * 2
             );
-            let right = match (k, session_status.is_empty()) {
-                (Some(k), false) => format!("[{k}]  {session_status}"),
-                (Some(k), true) => format!("[{k}]"),
+            let labels = r
+                .kinds
+                .as_ref()
+                .map(|kinds| kinds.iter().map(ProjectKind::label).collect::<Vec<_>>().join(","));
+            let right = match (labels, session_status.is_empty()) {
+                (Some(labels), false) => format!("[{labels}]  {session_status}"),
+                (Some(labels), true) => format!("[{labels}]"),
                 (None, false) => session_status.to_owned(),
                 (None, true) => String::new(),
             };
@@ -53,10 +59,13 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
                 String::new()
             } else {
                 " ".repeat(
-                    list_width.saturating_sub(left.chars().count() + right.chars().count()).max(1),
+                    list_width
+                        .saturating_sub(
+                            Line::from(left.as_str()).width() + Line::from(right.as_str()).width(),
+                        )
+                        .max(1),
                 )
             };
-            let text = format!("{left}{gap}{right}");
             let style = if r.hidden {
                 let style = Style::default().fg(Color::DarkGray);
                 if r.path == s.selected { style.add_modifier(Modifier::BOLD) } else { style }
@@ -65,7 +74,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(text, style)))
+            ListItem::new(Line::from(format!("{left}{gap}{right}")).style(style))
         })
         .collect::<Vec<_>>();
     s.project_list_state.select(rs.iter().position(|row| row.path == s.selected));
