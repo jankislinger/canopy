@@ -177,6 +177,12 @@ impl AppState {
                         Action::Refresh => self.request_project_scan(tx.clone()),
                         action => { let _ = self.handle_background_action(action, tx.clone()); }
                     },
+                    (Some(popup), Some(Action::Test)) if popup.success.is_some() => {
+                        self.run_command(CommandKind::Test, tx.clone());
+                    }
+                    (Some(popup), Some(Action::Lint)) if popup.success.is_some() => {
+                        self.run_command(CommandKind::Lint, tx.clone());
+                    }
                     (Some(_), Some(action)) => match action {
                         Action::Quit | Action::Cancel => {
                             self.command_popup = None;
