@@ -1,3 +1,4 @@
+use crate::backend::runner::{self, CommandCancellation};
 use crate::{
     action::Action,
     backend::{Project, ProjectKind, Repository, git::GitStatus},
@@ -8,20 +9,19 @@ use crate::{
     config::{DisplayMode, Settings},
     ui,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::{DefaultTerminal, widgets::ListState};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    io::Read,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     time::{self, Duration},
 };
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirmation {
-    StopSession,
+    StopSession { name: String, path: PathBuf },
 }
 
 pub struct CommandPopup {
@@ -72,6 +72,7 @@ pub struct AppState {
     pub project_scan_generation: u64,
     pub command_popup: Option<CommandPopup>,
     pub command_generation: u64,
+    pub command_cancellation: Option<CommandCancellation>,
     pub git_status: Option<GitStatus>,
     pub git_status_cache: HashMap<PathBuf, GitStatus>,
     pub git_status_loading: bool,
@@ -107,6 +108,7 @@ impl AppState {
             project_scan_generation: 0,
             command_popup: None,
             command_generation: 0,
+            command_cancellation: None,
             git_status: None,
             git_status_cache: HashMap::new(),
             git_status_loading: false,
@@ -143,6 +145,11 @@ impl AppState {
                         Some(action) => { let _ = self.handle_background_action(action, tx.clone()); }
                         None => break,
                     }
+                } else if self.confirmation.is_some() {
+                    match action {
+                        Some(action) => self.handle_confirmation_action(action, tx.clone()),
+                        None => break,
+                    }
                 } else { match (self.command_popup.as_ref(), action) {
                     (None, Some(action)) => match action {
                         Action::Quit => break,
@@ -164,10 +171,7 @@ impl AppState {
                         Action::Open => self.activate_session(),
                         Action::Start => self.start_session(),
                         Action::Stop => self.request_stop_session(),
-                        Action::Confirm => match self.confirmation.take() {
-                            Some(Confirmation::StopSession) => self.stop_session(),
-                            None => {}
-                        },
+                        Action::Confirm => {},
                         Action::Cancel => {
                             self.confirmation = None;
                             self.status.clear();
@@ -185,8 +189,7 @@ impl AppState {
                     }
                     (Some(_), Some(action)) => match action {
                         Action::Quit | Action::Cancel => {
-                            self.command_popup = None;
-                            self.command_generation += 1;
+                            self.close_command_popup();
                             self.confirmation = None;
                             self.status.clear();
                         }
@@ -213,6 +216,7 @@ impl AppState {
             Action::Resize => {}
             Action::CommandFinished { generation, title, output, success } => {
                 if generation == self.command_generation {
+                    self.command_cancellation = None;
                     if let Some(popup) = self.command_popup.as_mut() {
                         popup.title = title;
                         popup.output = output;
@@ -410,29 +414,46 @@ impl AppState {
     }
 
     fn request_stop_session(&mut self) {
-        if self
-            .selected_session_name()
-            .and_then(|name| {
-                self.sessions.iter().find(|session| session.name == name).map(|_| name)
-            })
-            .is_some()
+        if let Some(name) = self.selected_session_name()
+            && self.sessions.iter().any(|session| session.name == name)
         {
-            self.confirmation = Some(Confirmation::StopSession);
+            self.confirmation =
+                Some(Confirmation::StopSession { name, path: self.selected.clone() });
             self.status = "Stop session? y/n".into();
         }
     }
 
-    fn stop_session(&mut self) {
-        if let Some(name) = self.selected_session_name() {
-            match self.session_backend.stop(&name) {
-                Ok(()) => {
-                    self.refresh_sessions();
-                    self.status = format!("Stopped {name}");
+    fn handle_confirmation_action(&mut self, action: Action, tx: Sender<Action>) {
+        match action {
+            Action::Confirm => {
+                if let Some(Confirmation::StopSession { name, .. }) = self.confirmation.take() {
+                    self.stop_session(&name);
                 }
-                Err(error) => self.status = error.to_string(),
+            }
+            Action::Cancel | Action::Quit => {
+                self.confirmation = None;
+                self.status.clear();
+            }
+            action => {
+                let _ = self.handle_background_action(action, tx);
             }
         }
-        self.confirmation = None;
+    }
+
+    fn stop_session(&mut self, name: &str) {
+        match self.session_backend.stop(name) {
+            Ok(()) => {
+                self.refresh_sessions();
+                self.status = format!("Stopped {name}");
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn close_command_popup(&mut self) {
+        self.command_cancellation = None;
+        self.command_popup = None;
+        self.command_generation += 1;
     }
 
     fn run_command(&mut self, command: CommandKind, tx: Sender<Action>) {
@@ -450,10 +471,13 @@ impl AppState {
             follow: true,
             success: None,
         });
+        let cancellation = CommandCancellation::new();
+        let cancelled = cancellation.flag();
+        self.command_cancellation = Some(cancellation);
         let output_tx = tx.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                execute_commands_streaming(&project, command, generation, output_tx)
+                execute_commands_streaming(&project, command, generation, output_tx, &cancelled)
             })
             .await
             .unwrap_or_else(|error| (format!("Command task failed: {error}"), false));
@@ -592,6 +616,7 @@ fn execute_commands_streaming(
     command: CommandKind,
     generation: u64,
     tx: Sender<Action>,
+    cancelled: &AtomicBool,
 ) -> (String, bool) {
     let commands = project.commands(command);
     if commands.is_empty() {
@@ -600,10 +625,17 @@ fn execute_commands_streaming(
     let mut output = String::new();
     let mut success = true;
     for command in commands {
+        if cancelled.load(Ordering::Relaxed) {
+            return (output, false);
+        }
         let header = format!("$ {}\n", command.join(" "));
         output.push_str(&header);
-        let _ = tx.blocking_send(Action::CommandOutput { generation, output: header });
-        match execute_command_in_pty(&project.path, &command, generation, &tx) {
+        if !send_command_output(&tx, generation, header, cancelled) {
+            return (output, false);
+        }
+        match runner::execute(&project.path, &command, cancelled, |chunk| {
+            send_command_output(&tx, generation, chunk, cancelled)
+        }) {
             Ok((command_output, command_success)) => {
                 output.push_str(&command_output);
                 success &= command_success;
@@ -612,43 +644,35 @@ fn execute_commands_streaming(
                 let text = format!("failed to start command: {error}\n\n");
                 output.push_str(&text);
                 success = false;
-                let _ = tx.blocking_send(Action::CommandOutput { generation, output: text });
+                if !send_command_output(&tx, generation, text, cancelled) {
+                    return (output, false);
+                }
             }
         }
     }
     (output, success)
 }
 
-fn execute_command_in_pty(
-    path: &Path,
-    command: &[&str],
-    generation: u64,
+fn send_command_output(
     tx: &Sender<Action>,
-) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
-    let pty_system = native_pty_system();
-    let pair =
-        pty_system.openpty(PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 })?;
-    let mut builder = CommandBuilder::new(command[0]);
-    builder.args(&command[1..]);
-    builder.cwd(path);
-    let mut child = pair.slave.spawn_command(builder)?;
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader()?;
-    let mut command_output = String::new();
-    let mut buffer = [0_u8; 4096];
+    generation: u64,
+    output: String,
+    cancelled: &AtomicBool,
+) -> bool {
+    let mut action = Action::CommandOutput { generation, output };
     loop {
-        let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
         }
-        let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
-        command_output.push_str(&chunk);
-        let _ = tx.blocking_send(Action::CommandOutput { generation, output: chunk });
+        match tx.try_send(action) {
+            Ok(()) => return true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(pending)) => {
+                action = pending;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
-
-    let status = child.wait()?;
-    Ok((command_output, status.success()))
 }
 
 pub struct Row {
@@ -676,6 +700,104 @@ mod tests {
             ],
         }];
         (home, repositories, intermediate, project)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmation_blocks_navigation_and_stops_the_original_session() {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let temp = std::env::temp_dir().join(format!(
+            "canopy-confirm-test-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let executable = temp.join("tmux");
+        fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = kill-session ]; then printf '%s' \"$3\" > \"$0.stopped\"; fi\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let (home, repositories, _, project) = tree();
+        let mut state = AppState::new(
+            home,
+            repositories,
+            SessionBackend::new(executable),
+            Settings::default(),
+            None,
+        );
+        state.sessions.push(Session {
+            name: "my-repo".into(),
+            attached_clients: 0,
+            working_directory: state.selected.clone(),
+        });
+        state.request_stop_session();
+        let original = state.selected.clone();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        state.handle_confirmation_action(Action::Down, tx.clone());
+        state.handle_confirmation_action(Action::Start, tx.clone());
+        assert_eq!(state.selected, original);
+        assert_eq!(
+            state.confirmation,
+            Some(Confirmation::StopSession { name: "my-repo".into(), path: original })
+        );
+        // A background refresh may change selection even while the prompt is open.
+        state.selected = project;
+        state.handle_confirmation_action(Action::Confirm, tx);
+        assert_eq!(fs::read_to_string(temp.join("tmux.stopped")).unwrap(), "my-repo");
+        assert!(state.confirmation.is_none());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn cancelled_output_delivery_does_not_block_on_a_full_action_channel() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Action::Resize).unwrap();
+        let cancellation = CommandCancellation::new();
+        let flag = cancellation.flag();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            done_tx.send(send_command_output(&tx, 1, "output".into(), &flag)).unwrap();
+        });
+        drop(cancellation);
+        assert!(!done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    }
+
+    #[test]
+    fn closing_popup_cancels_the_command_and_rejects_late_output() {
+        let (home, repositories, _, _) = tree();
+        let mut state = AppState::new(
+            home,
+            repositories,
+            SessionBackend::new("/nonexistent-canopy-test-tmux"),
+            Settings::default(),
+            None,
+        );
+        let cancellation = CommandCancellation::new();
+        let flag = cancellation.flag();
+        state.command_cancellation = Some(cancellation);
+        state.command_popup = Some(CommandPopup {
+            title: "Test".into(),
+            output: String::new(),
+            scroll: 0,
+            follow: true,
+            success: None,
+        });
+        state.close_command_popup();
+        assert!(flag.load(Ordering::Relaxed));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        state
+            .handle_background_action(
+                Action::CommandFinished {
+                    generation: 0,
+                    title: "Test".into(),
+                    output: "late".into(),
+                    success: true,
+                },
+                tx,
+            )
+            .unwrap();
+        assert!(state.command_popup.is_none());
     }
 
     #[test]

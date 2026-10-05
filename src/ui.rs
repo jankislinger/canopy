@@ -1,5 +1,5 @@
 use crate::{
-    app::AppState,
+    app::{AppState, Confirmation},
     backend::{ProjectKind, sessions::Session},
 };
 use ansi_to_tui::IntoText;
@@ -94,13 +94,13 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
         .block(Block::bordered().title("Commands")),
         a[1],
     );
-    if s.confirmation.is_some() {
+    if let Some(Confirmation::StopSession { path, .. }) = &s.confirmation {
         let popup = centered_rect(60, 7, f.area());
         f.render_widget(Clear, popup);
         f.render_widget(
             Paragraph::new(vec![
                 Line::from("Stop the selected tmux session?"),
-                Line::from(s.selected.display().to_string()),
+                Line::from(path.display().to_string()),
                 Line::from("[y] confirm    [n/Esc] cancel"),
             ])
             .block(Block::bordered().title("Confirm stop")),
@@ -239,6 +239,7 @@ mod tests {
             project_scan_generation: 0,
             command_popup: None,
             command_generation: 0,
+            command_cancellation: None,
             git_status: Some(GitStatus {
                 repository: PathBuf::from("/home/test/repo"),
                 branch: "main".into(),
