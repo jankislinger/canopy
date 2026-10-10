@@ -70,6 +70,8 @@ pub struct AppState {
     pub session_backend: SessionBackend,
     pub confirmation: Option<Confirmation>,
     pub project_scan_generation: u64,
+    pub initializing: bool,
+    pub project_scan_pending: bool,
     pub command_popup: Option<CommandPopup>,
     pub command_generation: u64,
     pub command_cancellation: Option<CommandCancellation>,
@@ -102,10 +104,12 @@ impl AppState {
             completed: 0,
             spinner: 0,
             status: String::new(),
-            sessions: session_backend.list().unwrap_or_default(),
+            sessions: Vec::new(),
             session_backend,
             confirmation: None,
             project_scan_generation: 0,
+            initializing: false,
+            project_scan_pending: false,
             command_popup: None,
             command_generation: 0,
             command_cancellation: None,
@@ -131,15 +135,46 @@ impl AppState {
         rx: &mut Receiver<Action>,
         tx: Sender<Action>,
     ) -> color_eyre::Result<()> {
-        self.request_git_status(tx.clone());
+        self.request_sessions_refresh(tx.clone());
+        if self.initializing {
+            let home = self.home.clone();
+            let skipped_dirs = self.settings.skipped_dirs.clone();
+            let cache_tx = tx.clone();
+            tokio::spawn(async move {
+                let repositories = tokio::task::spawn_blocking(move || {
+                    crate::backend::cache::load(&home, &skipped_dirs)
+                })
+                .await
+                .unwrap_or_default();
+                let _ = cache_tx.send(Action::ProjectsCached { repositories }).await;
+            });
+        } else {
+            self.request_git_status(tx.clone());
+        }
         let mut tick = time::interval(Duration::from_millis(150));
         let mut sessions_tick = time::interval(Duration::from_secs(1));
         sessions_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         sessions_tick.tick().await;
+        let startup_logo_deadline = time::Instant::now() + Duration::from_secs(2);
+        let mut startup_logo_visible = self.initializing;
         loop {
-            terminal.draw(|f| ui::draw(f, &mut self))?;
+            terminal.draw(|f| {
+                if startup_logo_visible {
+                    ui::draw_loading(f);
+                } else {
+                    ui::draw(f, &mut self);
+                }
+            })?;
             tokio::select! {
-                action = rx.recv() => if self.error_popup.is_some() {
+                _ = time::sleep_until(startup_logo_deadline), if startup_logo_visible => {
+                    startup_logo_visible = false;
+                }
+                action = rx.recv() => if self.initializing || startup_logo_visible {
+                    match action {
+                        Some(Action::Quit) | None => break,
+                        Some(action) => { let _ = self.handle_background_action(action, tx.clone()); }
+                    }
+                } else if self.error_popup.is_some() {
                     match action {
                         Some(Action::Quit | Action::Cancel | Action::Open) => self.error_popup = None,
                         Some(action) => { let _ = self.handle_background_action(action, tx.clone()); }
@@ -264,8 +299,25 @@ impl AppState {
                     }
                 }
             }
+            Action::ProjectsCached { repositories } => {
+                if let Some(repositories) = repositories {
+                    self.repositories = repositories;
+                    self.expanded = self.initially_expanded_directories();
+                    self.selected = self
+                        .visible_rows()
+                        .first()
+                        .map(|row| row.path.clone())
+                        .unwrap_or_else(|| self.home.clone());
+                    self.initializing = false;
+                    self.request_git_status(tx.clone());
+                }
+                self.request_project_scan(tx);
+            }
             Action::ProjectsLoaded { generation, result } => {
                 if generation == self.project_scan_generation {
+                    self.project_scan_pending = false;
+                    let initial = self.initializing;
+                    self.initializing = false;
                     match result {
                         Ok(repositories) => {
                             let previously_expanded = self.expanded.clone();
@@ -275,6 +327,9 @@ impl AppState {
                                 .into_iter()
                                 .filter(|path| available.contains(path))
                                 .collect();
+                            if initial {
+                                self.expanded = self.initially_expanded_directories();
+                            }
                             self.expanded.insert(self.home.clone());
                             let visible = self.visible_rows();
                             if !visible.iter().any(|row| row.path == self.selected) {
@@ -305,16 +360,23 @@ impl AppState {
 
     /// Starts a background scan of the project tree.
     fn request_project_scan(&mut self, tx: Sender<Action>) {
+        if self.project_scan_pending {
+            return;
+        }
+        self.project_scan_pending = true;
         self.project_scan_generation += 1;
         let generation = self.project_scan_generation;
         let home = self.home.clone();
         let skipped_dirs = self.settings.skipped_dirs.clone();
         tokio::spawn(async move {
-            let result =
-                tokio::task::spawn_blocking(move || Repository::discover(&home, &skipped_dirs))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result.map_err(|error| error.to_string()));
+            let result = tokio::task::spawn_blocking(move || {
+                let repositories = Repository::discover(&home, &skipped_dirs)?;
+                let _ = crate::backend::cache::save(&home, &skipped_dirs, &repositories);
+                Ok::<_, color_eyre::Report>(repositories)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
             let _ = tx.send(Action::ProjectsLoaded { generation, result }).await;
         });
         self.status = "Scanning projects...".into();
@@ -700,6 +762,43 @@ mod tests {
             ],
         }];
         (home, repositories, intermediate, project)
+    }
+
+    #[tokio::test]
+    async fn initial_scan_opens_configured_tree_and_recovers_from_failure() {
+        let (home, repositories, _, _) = tree();
+        let mut state =
+            AppState::new(home, Vec::new(), SessionBackend::default(), Settings::default(), None);
+        state.initializing = true;
+        state.project_scan_pending = true;
+        state.project_scan_generation = 1;
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        state
+            .handle_background_action(
+                Action::ProjectsLoaded { generation: 0, result: Ok(Vec::new()) },
+                tx.clone(),
+            )
+            .unwrap();
+        assert!(state.initializing);
+        state
+            .handle_background_action(
+                Action::ProjectsLoaded { generation: 1, result: Ok(repositories) },
+                tx.clone(),
+            )
+            .unwrap();
+        assert!(!state.initializing);
+        assert!(!state.project_scan_pending);
+        assert_eq!(state.expanded, state.initially_expanded_directories());
+        assert!(!state.repositories.is_empty());
+        state.initializing = true;
+        state
+            .handle_background_action(
+                Action::ProjectsLoaded { generation: 1, result: Err("unavailable".into()) },
+                tx,
+            )
+            .unwrap();
+        assert!(!state.initializing);
+        assert!(state.status.contains("unavailable"));
     }
 
     #[cfg(unix)]

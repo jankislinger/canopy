@@ -9,8 +9,46 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, List, ListItem, Paragraph},
 };
+/// Shows a centered wordmark while the initial project list loads.
+pub(crate) fn draw_loading(f: &mut ratatui::Frame) {
+    let logo = [
+        " ██████╗ █████╗ ███╗   ██╗ ██████╗ ██████╗ ██╗   ██╗",
+        "██╔════╝██╔══██╗████╗  ██║██╔═══██╗██╔══██╗╚██╗ ██╔╝",
+        "██║     ███████║██╔██╗ ██║██║   ██║██████╔╝ ╚████╔╝ ",
+        "██║     ██╔══██║██║╚██╗██║██║   ██║██╔═══╝   ╚██╔╝  ",
+        "╚██████╗██║  ██║██║ ╚████║╚██████╔╝██║        ██║   ",
+        " ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝        ╚═╝   ",
+    ];
+    let area = f.area();
+    let mut lines: Vec<Line> = if area.width >= 54 {
+        logo.into_iter().map(Line::from).collect()
+    } else {
+        vec![Line::from("canopy")]
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from("Loading projects…"));
+    lines.push(Line::from("q: quit"));
+    let height = lines.len() as u16;
+    let rect = ratatui::layout::Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(height) / 2,
+        area.width,
+        height.min(area.height),
+    );
+    f.render_widget(
+        Paragraph::new(lines)
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::Cyan)),
+        rect,
+    );
+}
+
 /// Renders the project tree, details pane, and command hints.
 pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
+    if s.initializing {
+        draw_loading(f);
+        return;
+    }
     let a = Layout::vertical([Constraint::Min(8), Constraint::Length(5)]).split(f.area());
     let p =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(a[0]);
@@ -237,6 +275,8 @@ mod tests {
             session_backend: SessionBackend::default(),
             confirmation: None,
             project_scan_generation: 0,
+            initializing: false,
+            project_scan_pending: false,
             command_popup: None,
             command_generation: 0,
             command_cancellation: None,
@@ -280,6 +320,27 @@ mod tests {
         for (y, expected) in [(4, "123456"), (5, "abcdef")] {
             let rendered: String = (1..7).map(|x| buffer[(x, y)].symbol()).collect();
             assert_eq!(rendered, expected);
+        }
+    }
+
+    #[test]
+    fn startup_screen_handles_large_and_small_terminals() {
+        let mut state = test_state();
+        state.initializing = true;
+        for (width, height) in [(100, 24), (30, 10), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(!text.contains("Projects"));
+            if width > 1 {
+                assert!(text.contains("Loading projects…"));
+                if width < 54 {
+                    assert!(text.contains("canopy"));
+                } else {
+                    assert!(text.contains("██████"));
+                }
+            }
         }
     }
 

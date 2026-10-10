@@ -38,6 +38,9 @@ pub enum Action {
         generation: u64,
         result: Result<Vec<crate::backend::sessions::Session>, String>,
     },
+    ProjectsCached {
+        repositories: Option<Vec<crate::backend::Repository>>,
+    },
     ProjectsLoaded {
         generation: u64,
         result: Result<Vec<crate::backend::Repository>, String>,

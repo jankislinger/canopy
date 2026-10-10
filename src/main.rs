@@ -17,12 +17,6 @@ async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let home = backend::home_dir()?;
     let (settings, settings_error) = config::Settings::load(&home);
-    let repositories = tokio::task::spawn_blocking({
-        let home = home.clone();
-        let skipped_dirs = settings.skipped_dirs.clone();
-        move || backend::Repository::discover(&home, &skipped_dirs)
-    })
-    .await??;
     let mut terminal = ratatui::try_init()?;
     let (tx, mut rx) = mpsc::channel(8);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -31,13 +25,14 @@ async fn main() -> color_eyre::Result<()> {
         let shutdown = shutdown.clone();
         move || event::listen(tx, shutdown)
     });
-    let state = app::AppState::new(
+    let mut state = app::AppState::new(
         home,
-        repositories,
+        Vec::new(),
         backend::sessions::SessionBackend::default(),
         settings,
         settings_error,
     );
+    state.initializing = true;
     let result = state.run(&mut terminal, &mut rx, tx).await;
     ratatui::try_restore()?;
     shutdown.store(true, Ordering::Relaxed);

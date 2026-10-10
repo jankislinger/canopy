@@ -9,7 +9,7 @@ use std::{
 static JUST_RECIPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\w+):([^=]|$)").expect("valid Just recipe pattern"));
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProjectKind {
     Git,
     Python,
@@ -26,7 +26,7 @@ impl ProjectKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     pub path: PathBuf,
     kinds: Vec<ProjectKind>,
@@ -101,7 +101,7 @@ impl Project {
         commands
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Repository {
     pub path: PathBuf,
     pub projects: Vec<Project>,
