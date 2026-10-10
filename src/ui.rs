@@ -171,6 +171,17 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
             area,
         );
     }
+    if s.tmux_warning {
+        let area = centered_rect(70, 9, f.area());
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new("Canopy was started outside tmux.\n\nSwitching to project sessions requires tmux.\nStart Canopy inside tmux, for example: tmux new-session canopy\n\nEnter/Esc: dismiss    q: quit")
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::bordered().title("Warning: outside tmux")
+                    .border_style(Style::default().fg(Color::Yellow))),
+            area,
+        );
+    }
     if let Some(error) = &s.error_popup {
         let area = centered_rect(70, 9, f.area());
         f.render_widget(Clear, area);
@@ -267,6 +278,7 @@ mod tests {
             show_hidden: false,
             settings: Settings::default(),
             error_popup: None,
+            tmux_warning: false,
             loading: false,
             completed: 0,
             spinner: 0,
@@ -327,12 +339,14 @@ mod tests {
     fn startup_screen_handles_large_and_small_terminals() {
         let mut state = test_state();
         state.initializing = true;
+        state.tmux_warning = true;
         for (width, height) in [(100, 24), (30, 10), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| draw(frame, &mut state)).unwrap();
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
             assert!(!text.contains("Projects"));
+            assert!(!text.contains("outside tmux"));
             if width > 1 {
                 assert!(text.contains("Loading projects…"));
                 if width < 54 {
@@ -342,6 +356,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tmux_warning_is_visible_after_loading_and_can_be_dismissed() {
+        let mut state = test_state();
+        state.tmux_warning = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Warning: outside tmux"));
+        assert!(text.contains("tmux new-session canopy"));
+        state.tmux_warning = false;
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!text.contains("Warning: outside tmux"));
     }
 
     #[test]

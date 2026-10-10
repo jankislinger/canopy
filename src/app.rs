@@ -62,6 +62,7 @@ pub struct AppState {
     pub show_hidden: bool,
     pub settings: Settings,
     pub error_popup: Option<String>,
+    pub tmux_warning: bool,
     pub loading: bool,
     pub completed: usize,
     pub spinner: usize,
@@ -100,6 +101,7 @@ impl AppState {
             show_hidden: false,
             settings,
             error_popup: settings_error,
+            tmux_warning: false,
             loading: false,
             completed: 0,
             spinner: 0,
@@ -179,6 +181,12 @@ impl AppState {
                         Some(Action::Quit | Action::Cancel | Action::Open) => self.error_popup = None,
                         Some(action) => { let _ = self.handle_background_action(action, tx.clone()); }
                         None => break,
+                    }
+                } else if self.tmux_warning {
+                    match action {
+                        Some(Action::Quit) | None => break,
+                        Some(Action::Cancel | Action::Open) => self.tmux_warning = false,
+                        Some(action) => { let _ = self.handle_background_action(action, tx.clone()); }
                     }
                 } else if self.confirmation.is_some() {
                     match action {
