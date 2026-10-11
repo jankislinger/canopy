@@ -68,6 +68,7 @@ pub struct AppState {
     pub spinner: usize,
     pub status: String,
     pub sessions: Vec<Session>,
+    pub open_window_pending: bool,
     pub session_backend: SessionBackend,
     pub confirmation: Option<Confirmation>,
     pub project_scan_generation: u64,
@@ -107,6 +108,7 @@ impl AppState {
             spinner: 0,
             status: String::new(),
             sessions: Vec::new(),
+            open_window_pending: false,
             session_backend,
             confirmation: None,
             project_scan_generation: 0,
@@ -194,7 +196,9 @@ impl AppState {
                         None => break,
                     }
                 } else { match (self.command_popup.as_ref(), action) {
-                    (None, Some(action)) => match action {
+                    (None, Some(action)) => {
+                        let Some(action) = self.handle_window_shortcut(action) else { continue; };
+                        match action {
                         Action::Quit => break,
                         Action::Up => {
                             self.move_selection(-1);
@@ -223,7 +227,7 @@ impl AppState {
                         Action::Lint => self.run_command(CommandKind::Lint, tx.clone()),
                         Action::Refresh => self.request_project_scan(tx.clone()),
                         action => { let _ = self.handle_background_action(action, tx.clone()); }
-                    },
+                    }},
                     (Some(popup), Some(Action::Test)) if popup.success.is_some() => {
                         self.run_command(CommandKind::Test, tx.clone());
                     }
@@ -448,6 +452,64 @@ impl AppState {
         } else {
             None
         }
+    }
+
+    pub fn selected_session(&self) -> Option<&Session> {
+        let name = self.selected_session_name()?;
+        self.sessions.iter().find(|session| session.name == name)
+    }
+
+    fn handle_window_shortcut(&mut self, action: Action) -> Option<Action> {
+        if self.open_window_pending {
+            match action {
+                Action::WindowDigit(index) => {
+                    self.open_window_pending = false;
+                    self.activate_window(index);
+                    return None;
+                }
+                Action::Resize
+                | Action::Done
+                | Action::SessionsLoaded { .. }
+                | Action::GitStatusLoaded { .. }
+                | Action::ProjectsCached { .. }
+                | Action::ProjectsLoaded { .. }
+                | Action::CommandOutput { .. }
+                | Action::CommandFinished { .. } => {}
+                _ => {
+                    self.open_window_pending = false;
+                    self.status.clear();
+                }
+            }
+        }
+        match action {
+            Action::OpenWindowPrefix => {
+                if self.selected_session().is_some() {
+                    self.open_window_pending = true;
+                    self.status = "Open window: press tmux index 0–9 (Esc cancels)".into();
+                } else {
+                    self.status = "No running session for this project; Enter creates one".into();
+                }
+                None
+            }
+            Action::WindowDigit(_) => None,
+            action => Some(action),
+        }
+    }
+
+    fn activate_window(&mut self, index: usize) {
+        let Some(session) = self.selected_session() else {
+            self.status = "No running session for this project".into();
+            return;
+        };
+        let Some(window) = session.windows.iter().find(|window| window.index == index) else {
+            self.status = format!("No window {index} in {}", session.name);
+            return;
+        };
+        self.status = match self.session_backend.switch_to_window(&session.name, &window.id) {
+            Ok(()) => format!("Switched to {}:{index} ({})", session.name, window.name),
+            Err(error) => error.to_string(),
+        };
+        self.refresh_sessions();
     }
 
     fn start_session(&mut self) {
@@ -772,6 +834,59 @@ mod tests {
         (home, repositories, intermediate, project)
     }
 
+    #[test]
+    fn window_shortcut_preserves_tmux_indices_and_cancels_on_navigation() {
+        let (home, repositories, _, _) = tree();
+        let mut state = AppState::new(
+            home,
+            repositories,
+            SessionBackend::new("/nonexistent-canopy-test-tmux"),
+            Settings::default(),
+            None,
+        );
+        state.sessions.push(Session {
+            name: Session::name_for_path(&state.selected),
+            attached_clients: 0,
+            working_directory: state.selected.clone(),
+            windows: vec![crate::backend::sessions::Window {
+                index: 3,
+                id: "@42".into(),
+                name: "agent".into(),
+                active: true,
+                pane_count: 1,
+                command: "codex".into(),
+                working_directory: state.selected.clone(),
+            }],
+        });
+        assert!(state.handle_window_shortcut(Action::OpenWindowPrefix).is_none());
+        assert!(state.open_window_pending);
+        // Background updates must not consume the prefix.
+        assert!(matches!(
+            state.handle_window_shortcut(Action::SessionsLoaded {
+                generation: 0,
+                result: Ok(Vec::new()),
+            }),
+            Some(Action::SessionsLoaded { .. })
+        ));
+        assert!(state.open_window_pending);
+        assert!(matches!(state.handle_window_shortcut(Action::Done), Some(Action::Done)));
+        assert!(state.open_window_pending);
+        state.handle_window_shortcut(Action::WindowDigit(1));
+        assert!(!state.open_window_pending);
+        assert!(state.status.starts_with("No window 1"));
+        state.handle_window_shortcut(Action::OpenWindowPrefix);
+        assert!(matches!(state.handle_window_shortcut(Action::Down), Some(Action::Down)));
+        assert!(!state.open_window_pending);
+        assert!(state.status.is_empty());
+        state.handle_window_shortcut(Action::OpenWindowPrefix);
+        assert!(matches!(state.handle_window_shortcut(Action::Cancel), Some(Action::Cancel)));
+        assert!(!state.open_window_pending);
+        state.sessions.clear();
+        state.handle_window_shortcut(Action::OpenWindowPrefix);
+        assert!(!state.open_window_pending);
+        assert!(state.status.starts_with("No running session"));
+    }
+
     #[tokio::test]
     async fn initial_scan_opens_configured_tree_and_recovers_from_failure() {
         let (home, repositories, _, _) = tree();
@@ -837,6 +952,7 @@ mod tests {
             name: "my-repo".into(),
             attached_clients: 0,
             working_directory: state.selected.clone(),
+            windows: Vec::new(),
         });
         state.request_stop_session();
         let original = state.selected.clone();

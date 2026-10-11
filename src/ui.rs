@@ -54,6 +54,24 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(a[0]);
     let rs = s.visible_rows();
     let list_width = p[0].width.saturating_sub(2) as usize;
+    // Budget for the widest visible project, including its depth below Home.
+    // Use the longest status so attaching a client doesn't change the layout.
+    let compact_status = rs
+        .iter()
+        .filter_map(|row| {
+            let kinds = row.kinds.as_ref()?;
+            let name = row.path.file_name().unwrap_or(row.path.as_os_str()).to_string_lossy();
+            let labels = kinds.iter().map(ProjectKind::label).collect::<Vec<_>>().join(",");
+            Some(
+                3 + row.depth * 2
+                    + Line::from(name.as_ref()).width()
+                    + 1
+                    + Line::from(format!("[{labels}]  ●  attached")).width(),
+            )
+        })
+        .max()
+        .unwrap_or(0)
+        > list_width;
     let items = rs
         .iter()
         .map(|r| {
@@ -71,13 +89,15 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
                 .map(|_| {
                     let name = Session::name_for_path(&r.path);
                     match s.sessions.iter().find(|session| session.name == name) {
+                        Some(_) if compact_status => "●",
+                        None if compact_status => "○",
                         Some(session) if session.attached_clients > 0 => "●  attached",
                         Some(_) => "●   running",
                         None => "○   stopped",
                     }
                 })
                 .unwrap_or("");
-            let left = format!(
+            let mut left = format!(
                 "{}{:indent$}{m} {n}",
                 if r.path == s.selected { "›" } else { " " },
                 "",
@@ -87,12 +107,21 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
                 .kinds
                 .as_ref()
                 .map(|kinds| kinds.iter().map(ProjectKind::label).collect::<Vec<_>>().join(","));
-            let right = match (labels, session_status.is_empty()) {
+            let mut right = match (labels, session_status.is_empty()) {
                 (Some(labels), false) => format!("[{labels}]  {session_status}"),
                 (Some(labels), true) => format!("[{labels}]"),
                 (None, false) => session_status.to_owned(),
                 (None, true) => String::new(),
             };
+            // Keep the state indicator visible even when names or indentation
+            // exceed the available width. Drop labels only as a last resort.
+            if compact_status && Line::from(right.as_str()).width() + 1 >= list_width {
+                right = session_status.to_owned();
+            }
+            if !right.is_empty() {
+                let left_width = list_width.saturating_sub(Line::from(right.as_str()).width() + 1);
+                left = truncate_project_name(&left, left_width);
+            }
             let gap = if right.is_empty() {
                 String::new()
             } else {
@@ -101,7 +130,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
                         .saturating_sub(
                             Line::from(left.as_str()).width() + Line::from(right.as_str()).width(),
                         )
-                        .max(1),
+                        .max(usize::from(!left.is_empty())),
                 )
             };
             let style = if r.hidden {
@@ -124,7 +153,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
     f.render_widget(details(s), p[1]);
     f.render_widget(
         Paragraph::new(vec![
-            Line::from("Enter: switch  s: start  x: stop"),
+            Line::from("Enter: switch  o0–9: window  s: start  x: stop"),
             Line::from("t: test  l: lint  r: refresh  H: hidden"),
             Line::from("Esc: close popup  q: quit"),
             Line::from(if s.confirmation.is_some() { "Confirm stop: y/n" } else { &s.status }),
@@ -194,6 +223,27 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
     }
 }
 
+fn truncate_project_name(text: &str, width: usize) -> String {
+    if Line::from(text).width() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut truncated = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let character_width = Line::from(character.to_string()).width();
+        if used + character_width > width - 1 {
+            break;
+        }
+        truncated.push(character);
+        used += character_width;
+    }
+    truncated.push('…');
+    truncated
+}
+
 fn details(s: &AppState) -> Paragraph<'_> {
     let mut lines = vec![Line::from(s.selected.display().to_string())];
     if s.git_status_loading {
@@ -233,6 +283,37 @@ fn details(s: &AppState) -> Paragraph<'_> {
         }
     } else {
         lines.push(Line::from("Not in a Git repository"));
+    }
+    if let Some(session) = s.selected_session() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "tmux: {} · {}",
+            session.name,
+            if session.attached_clients > 0 {
+                format!("attached ({} clients)", session.attached_clients)
+            } else {
+                "running".into()
+            }
+        )));
+        for window in &session.windows {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "  {}: {}{}",
+                        window.index,
+                        window.name,
+                        if window.active { " *" } else { "" }
+                    ),
+                    if window.active { Style::default().fg(Color::Cyan) } else { Style::default() },
+                ),
+                Span::raw(format!(
+                    " · {} {} · {}",
+                    window.pane_count,
+                    if window.pane_count == 1 { "pane" } else { "panes" },
+                    window.command
+                )),
+            ]));
+        }
     }
     Paragraph::new(lines).block(Block::bordered().title("Details"))
 }
@@ -284,6 +365,7 @@ mod tests {
             spinner: 0,
             status: String::new(),
             sessions: Vec::new(),
+            open_window_pending: false,
             session_backend: SessionBackend::default(),
             confirmation: None,
             project_scan_generation: 0,
@@ -332,6 +414,40 @@ mod tests {
         for (y, expected) in [(4, "123456"), (5, "abcdef")] {
             let rendered: String = (1..7).map(|x| buffer[(x, y)].symbol()).collect();
             assert_eq!(rendered, expected);
+        }
+    }
+
+    #[test]
+    fn details_shows_windows_for_running_and_attached_sessions() {
+        use crate::backend::sessions::{Session, Window};
+        let mut state = test_state();
+        state.repositories.push(Repository {
+            path: state.selected.clone(),
+            projects: vec![Project::new(state.selected.clone(), vec![ProjectKind::Git], None)],
+        });
+        state.sessions.push(Session {
+            name: Session::name_for_path(&state.selected),
+            attached_clients: 0,
+            working_directory: state.selected.clone(),
+            windows: vec![Window {
+                index: 3,
+                id: "@42".into(),
+                name: "agent".into(),
+                active: true,
+                pane_count: 2,
+                command: "codex".into(),
+                working_directory: state.selected.clone(),
+            }],
+        });
+        for clients in [0, 2] {
+            state.sessions[0].attached_clients = clients;
+            let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+            terminal.draw(|frame| frame.render_widget(details(&state), frame.area())).unwrap();
+            let text: String =
+                terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains(if clients == 0 { "running" } else { "attached (2 clients)" }));
+            assert!(text.contains("3: agent * · 2 panes · codex"));
+            assert!(text.contains("123456"));
         }
     }
 
@@ -397,6 +513,66 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(2, 1)].symbol(), "▾");
         assert_eq!(buffer[(4, 2)].symbol(), " ");
+    }
+
+    #[test]
+    fn project_status_compacts_based_on_names_depth_and_available_width() {
+        use crate::backend::sessions::Session;
+        // A top-level "repo" with [Git] needs 26 columns including full status.
+        for (path, inner_width, compact) in [
+            ("repo", 26, false),
+            ("repo", 25, true),
+            ("work/repos/repo", 26, true),
+            ("some-long-project", 26, true),
+            ("工具工具", 26, true),
+            ("some-long-project", 12, true),
+            ("repo", 8, true),
+            ("repo", 1, true),
+        ] {
+            let mut state = test_state();
+            state.selected = state.home.join(path);
+            state.repositories = vec![Repository {
+                path: state.selected.clone(),
+                projects: vec![Project::new(state.selected.clone(), vec![ProjectKind::Git], None)],
+            }];
+            for ancestor in state.selected.ancestors().skip(1) {
+                state.expanded.insert(ancestor.to_path_buf());
+            }
+            let row =
+                state.visible_rows().iter().position(|row| row.path == state.selected).unwrap()
+                    as u16
+                    + 1;
+            for clients in [None, Some(0), Some(1)] {
+                state.sessions = clients
+                    .map(|attached_clients| Session {
+                        name: Session::name_for_path(&state.selected),
+                        attached_clients,
+                        working_directory: state.selected.clone(),
+                        windows: Vec::new(),
+                    })
+                    .into_iter()
+                    .collect();
+                let mut terminal =
+                    Terminal::new(TestBackend::new((inner_width + 2) * 2, 24)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let text: String = (1..=inner_width).map(|x| buffer[(x, row)].symbol()).collect();
+                let indicator = if clients.is_some() { "●" } else { "○" };
+                assert!(text.contains(indicator), "{path} at {inner_width}: {text}");
+                let status = match clients {
+                    None => "stopped",
+                    Some(0) => "running",
+                    Some(_) => "attached",
+                };
+                assert_eq!(text.contains(status), !compact, "{path} at {inner_width}: {text}");
+                if !compact {
+                    assert!(text.contains("repo"));
+                }
+                if path == "some-long-project" && inner_width == 12 {
+                    assert!(text.contains('…'));
+                }
+            }
+        }
     }
 
     #[test]

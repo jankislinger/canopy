@@ -16,11 +16,15 @@ The application currently:
 - detects nested Python and Rust projects using `pyproject.toml` and `Cargo.toml`;
 - displays a filesystem-style project tree with Git/Python/Rust indicators;
 - supports arrow-key navigation and directory expansion/collapse;
-- opens selected projects in `nvim` with `Enter`;
+- creates persistent tmux project sessions with editor, agent, and terminal windows;
+- switches to the selected project's last active tmux window with `Enter` (creating its session if needed);
+- shows running/attached sessions and their windows in Details, refreshed every second;
+- opens a window with `o` followed by its actual tmux index (`0`–`9`), for example `o1` for window 1; `Esc` cancels the prefix;
+- starts sessions with `s` and stops them with `x` followed by confirmation;
 - refreshes discovery with `r` and exits with `q`;
 - includes an `Experiments` panel for testing behavior.
 
-The project is currently a local project browser. tmux-backed persistent workspaces, session switching, configurable scan roots, and project-specific commands are planned but not implemented yet. See [DESIGN.md](DESIGN.md) for the planned direction.
+Run Canopy inside tmux to switch between project sessions. The window shortcut uses the indices displayed in Details and only opens existing sessions/windows. It respects tmux's configured starting index and gaps: `o1` means window 1, while `o0` means window 0. Details shows each window's name, an `*` for the active window, pane count, and the active pane's command. See [DESIGN.md](DESIGN.md) for the planned direction.
 
 ## Configuration
 
