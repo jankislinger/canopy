@@ -154,7 +154,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
     f.render_widget(
         Paragraph::new(vec![
             Line::from("Enter: switch  o0–9: window  s: start  x: stop"),
-            Line::from("t: test  l: lint  r: refresh  H: hidden"),
+            Line::from("t: test  l: lint  :: Just  r: refresh  H: hidden"),
             Line::from("Esc: close popup  q: quit"),
             Line::from(if s.confirmation.is_some() { "Confirm stop: y/n" } else { &s.status }),
         ])
@@ -199,6 +199,103 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
             .wrap(ratatui::widgets::Wrap { trim: false }),
             area,
         );
+    }
+    if let Some(prompt) = &mut s.recipe_prompt {
+        let matches = prompt.filtered_recipes();
+        let selected = matches.iter().position(|(index, _)| Some(*index) == prompt.selected);
+        let recipe_name = selected.map(|position| matches[position].1.name.as_str()).unwrap_or("");
+        let height =
+            prompt.listing.as_deref().unwrap_or("").lines().count().clamp(1, 8) as u16 + 10;
+        let area = centered_rect(75, height, f.area());
+        f.render_widget(Clear, area);
+        let block =
+            Block::bordered().title("Just recipes").border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let sections = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+        prompt.list_state.select(selected);
+        let items = matches
+            .iter()
+            .map(|(_, recipe)| ListItem::new(recipe.display.clone()))
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            f.render_widget(
+                Paragraph::new(if prompt.listing.is_none() {
+                    "Loading recipes..."
+                } else {
+                    "No matching recipes"
+                }),
+                sections[0],
+            );
+        } else {
+            f.render_stateful_widget(
+                List::new(items)
+                    .highlight_symbol("› ")
+                    .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    .scroll_padding(1),
+                sections[0],
+                &mut prompt.list_state,
+            );
+        }
+        f.render_widget(
+            Paragraph::new("↑/↓: select  Tab: filter/args  Enter: run  Esc: cancel")
+                .style(Style::default().fg(Color::DarkGray)),
+            sections[1],
+        );
+        f.render_widget(
+            Paragraph::new(prompt.error.as_deref().unwrap_or(""))
+                .style(Style::default().fg(Color::Red)),
+            sections[2],
+        );
+        let input_block = Block::bordered().title("Filter recipes");
+        let input_area = input_block.inner(sections[3]);
+        let input = format!("> {}", prompt.input);
+        let cursor_column = Line::from(format!("> {}", &prompt.input[..prompt.cursor])).width();
+        let horizontal_scroll = cursor_column
+            .saturating_sub(input_area.width.saturating_sub(1) as usize)
+            .min(u16::MAX as usize) as u16;
+        f.render_widget(
+            Paragraph::new(input).block(input_block).scroll((0, horizontal_scroll)),
+            sections[3],
+        );
+        if !prompt.editing_arguments && input_area.width > 0 && input_area.height > 0 {
+            f.set_cursor_position((
+                input_area.x
+                    + (cursor_column - horizontal_scroll as usize)
+                        .min(input_area.width as usize - 1) as u16,
+                input_area.y,
+            ));
+        }
+        let arguments_block = Block::bordered().title("Arguments (Tab)");
+        let arguments_area = arguments_block.inner(sections[4]);
+        let arguments = format!("just {recipe_name} {}", prompt.arguments);
+        let cursor_column = Line::from(format!(
+            "just {recipe_name} {}",
+            &prompt.arguments[..prompt.argument_cursor]
+        ))
+        .width();
+        let horizontal_scroll = cursor_column
+            .saturating_sub(arguments_area.width.saturating_sub(1) as usize)
+            .min(u16::MAX as usize) as u16;
+        f.render_widget(
+            Paragraph::new(arguments).block(arguments_block).scroll((0, horizontal_scroll)),
+            sections[4],
+        );
+        if prompt.editing_arguments && arguments_area.width > 0 && arguments_area.height > 0 {
+            f.set_cursor_position((
+                arguments_area.x
+                    + (cursor_column - horizontal_scroll as usize)
+                        .min(arguments_area.width as usize - 1) as u16,
+                arguments_area.y,
+            ));
+        }
     }
     if s.tmux_warning {
         let area = centered_rect(70, 9, f.area());
@@ -315,6 +412,11 @@ fn details(s: &AppState) -> Paragraph<'_> {
             ]));
         }
     }
+    if let Some(listing) = &s.just_listing {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Just recipes:"));
+        lines.extend(listing.lines().map(Line::from));
+    }
     Paragraph::new(lines).block(Block::bordered().title("Details"))
 }
 
@@ -372,6 +474,7 @@ mod tests {
             initializing: false,
             project_scan_pending: false,
             command_popup: None,
+            recipe_prompt: None,
             command_generation: 0,
             command_cancellation: None,
             git_status: Some(GitStatus {
@@ -395,6 +498,7 @@ mod tests {
                     },
                 ],
             }),
+            just_listing: None,
             git_status_cache: Default::default(),
             git_status_loading: false,
             git_status_generation: 0,
@@ -448,6 +552,59 @@ mod tests {
             assert!(text.contains(if clients == 0 { "running" } else { "attached (2 clients)" }));
             assert!(text.contains("3: agent * · 2 panes · codex"));
             assert!(text.contains("123456"));
+        }
+    }
+
+    #[test]
+    fn details_omits_missing_justfile_and_separates_recipe_listing_from_commits() {
+        let mut state = test_state();
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| frame.render_widget(details(&state), frame.area())).unwrap();
+        let text: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!text.contains("Just recipes:"));
+
+        state.just_listing =
+            Some("  deploy target  # Deploy to target\n  test           # Run tests".into());
+        terminal.draw(|frame| frame.render_widget(details(&state), frame.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| (1..99).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(5).contains("abcdef"));
+        assert!(row(6).trim().is_empty());
+        assert!(row(7).contains("Just recipes:"));
+        assert!(row(8).contains("deploy target  # Deploy to target"));
+        assert!(row(9).contains("test           # Run tests"));
+    }
+
+    #[test]
+    fn recipe_prompt_shows_recipes_and_command_input_at_different_sizes() {
+        let mut state = test_state();
+        state.recipe_prompt = Some(crate::app::RecipePrompt::new(
+            state.selected.clone(),
+            state.selected.join("justfile"),
+            0,
+            Some("  deploy target  # Deploy\n  test           # Test".into()),
+        ));
+        let prompt = state.recipe_prompt.as_mut().unwrap();
+        prompt.input = "dply".into();
+        prompt.cursor = prompt.input.len();
+        prompt.arguments = "'a long target name'".into();
+        prompt.argument_cursor = prompt.arguments.len();
+        prompt.editing_arguments = true;
+        for (width, height) in [(100, 24), (32, 12), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            if width == 100 {
+                let text: String =
+                    terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains("Just recipes"));
+                assert!(text.contains("deploy target  # Deploy"));
+                assert!(text.contains("just deploy 'a long target name'"));
+            }
+            if width > 1 {
+                let cursor = terminal.get_cursor_position().unwrap();
+                assert!(cursor.x < width && cursor.y < height);
+            }
         }
     }
 

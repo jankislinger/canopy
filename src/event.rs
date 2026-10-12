@@ -1,5 +1,5 @@
 use crate::action::Action;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyEventKind};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -18,7 +18,7 @@ pub fn listen(action_tx: Sender<Action>, shutdown: Arc<AtomicBool>) -> color_eyr
             continue;
         }
         let action = match event::read()? {
-            Event::Key(key) => Action::from_key(key.code),
+            Event::Key(key) if key.kind != KeyEventKind::Release => Some(Action::Key(key)),
             Event::Resize(_, _) => Some(Action::Resize),
             _ => None,
         };

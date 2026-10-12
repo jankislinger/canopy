@@ -9,6 +9,7 @@ use crate::{
     config::{DisplayMode, Settings},
     ui,
 };
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{DefaultTerminal, widgets::ListState};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -30,6 +31,139 @@ pub struct CommandPopup {
     pub scroll: u16,
     pub follow: bool,
     pub success: Option<bool>,
+}
+
+pub struct RecipePrompt {
+    pub path: PathBuf,
+    pub justfile: PathBuf,
+    pub generation: u64,
+    pub listing: Option<String>,
+    pub input: String,
+    pub cursor: usize,
+    pub list_state: ListState,
+    pub selected: Option<usize>,
+    pub manually_selected: bool,
+    pub arguments: String,
+    pub argument_cursor: usize,
+    pub editing_arguments: bool,
+    pub error: Option<String>,
+}
+
+impl RecipePrompt {
+    pub fn new(path: PathBuf, justfile: PathBuf, generation: u64, listing: Option<String>) -> Self {
+        let mut prompt = Self {
+            path,
+            justfile,
+            generation,
+            listing,
+            input: String::new(),
+            cursor: 0,
+            list_state: ListState::default(),
+            selected: None,
+            manually_selected: false,
+            arguments: String::new(),
+            argument_cursor: 0,
+            editing_arguments: false,
+            error: None,
+        };
+        prompt.reconcile_selection();
+        prompt
+    }
+
+    pub fn filtered_recipes(&self) -> Vec<(usize, crate::backend::just::Recipe)> {
+        let mut matches: Vec<_> =
+            crate::backend::just::Recipe::parse_listing(self.listing.as_deref().unwrap_or(""))
+                .into_iter()
+                .enumerate()
+                .filter(|(_, recipe)| recipe.matches(&self.input))
+                .collect();
+        matches.sort_by(|(_, left), (_, right)| left.name.cmp(&right.name));
+        matches
+    }
+
+    fn reconcile_selection(&mut self) {
+        let matches = self.filtered_recipes();
+        if self.selected.is_some_and(|selected| matches.iter().any(|(index, _)| *index == selected))
+        {
+            return;
+        }
+        self.selected = self
+            .selected
+            .and_then(|selected| {
+                matches.iter().filter(|(index, _)| *index < selected).map(|(index, _)| *index).max()
+            })
+            .or_else(|| matches.first().map(|(index, _)| *index));
+    }
+
+    fn filter_changed(&mut self, previous_matches: &[(usize, crate::backend::just::Recipe)]) {
+        let matches = self.filtered_recipes();
+        // Exact names win; otherwise a prefix selects the first alphabetical
+        // match until the user takes control with arrows.
+        if self.input.trim().is_empty() {
+            self.manually_selected = false;
+        }
+        if let Some((index, _)) =
+            matches.iter().find(|(_, recipe)| recipe.is_exact_match(&self.input))
+        {
+            self.selected = Some(*index);
+            self.manually_selected = false;
+            return;
+        }
+        if !self.manually_selected
+            && let Some((index, _)) =
+                matches.iter().find(|(_, recipe)| recipe.is_name_prefix(&self.input))
+        {
+            self.selected = Some(*index);
+            return;
+        }
+        if self.selected.is_some_and(|selected| matches.iter().any(|(index, _)| *index == selected))
+        {
+            return;
+        }
+        self.selected = self
+            .selected
+            .and_then(|selected| {
+                let position = previous_matches.iter().position(|(index, _)| *index == selected)?;
+                previous_matches[..position]
+                    .iter()
+                    .rev()
+                    .find(|(index, _)| matches.iter().any(|(survivor, _)| survivor == index))
+                    .map(|(index, _)| *index)
+            })
+            .or_else(|| matches.first().map(|(index, _)| *index));
+    }
+
+    fn move_recipe(&mut self, delta: isize) {
+        self.reconcile_selection();
+        let matches = self.filtered_recipes();
+        if let Some(position) = matches.iter().position(|(index, _)| Some(*index) == self.selected)
+        {
+            let next = position.saturating_add_signed(delta).min(matches.len() - 1);
+            self.selected = Some(matches[next].0);
+            self.manually_selected = true;
+        }
+    }
+
+    fn update_listing(&mut self, listing: Option<String>) {
+        let previous_matches = self.filtered_recipes();
+        let selected_name = self
+            .filtered_recipes()
+            .into_iter()
+            .find(|(index, _)| Some(*index) == self.selected)
+            .map(|(_, recipe)| recipe.name);
+        self.listing = listing;
+        if let Some(name) = selected_name {
+            self.selected =
+                crate::backend::just::Recipe::parse_listing(self.listing.as_deref().unwrap_or(""))
+                    .iter()
+                    .position(|recipe| recipe.name == name);
+        }
+        if self.selected.is_none() {
+            self.filter_changed(&previous_matches);
+        } else {
+            self.reconcile_selection();
+        }
+    }
 }
 
 impl CommandPopup {
@@ -75,9 +209,11 @@ pub struct AppState {
     pub initializing: bool,
     pub project_scan_pending: bool,
     pub command_popup: Option<CommandPopup>,
+    pub recipe_prompt: Option<RecipePrompt>,
     pub command_generation: u64,
     pub command_cancellation: Option<CommandCancellation>,
     pub git_status: Option<GitStatus>,
+    pub just_listing: Option<String>,
     pub git_status_cache: HashMap<PathBuf, GitStatus>,
     pub git_status_loading: bool,
     pub git_status_generation: u64,
@@ -115,9 +251,11 @@ impl AppState {
             initializing: false,
             project_scan_pending: false,
             command_popup: None,
+            recipe_prompt: None,
             command_generation: 0,
             command_cancellation: None,
             git_status: None,
+            just_listing: None,
             git_status_cache: HashMap::new(),
             git_status_loading: false,
             git_status_generation: 0,
@@ -153,7 +291,7 @@ impl AppState {
                 let _ = cache_tx.send(Action::ProjectsCached { repositories }).await;
             });
         } else {
-            self.request_git_status(tx.clone());
+            self.request_selected_details(tx.clone());
         }
         let mut tick = time::interval(Duration::from_millis(150));
         let mut sessions_tick = time::interval(Duration::from_secs(1));
@@ -173,7 +311,19 @@ impl AppState {
                 _ = time::sleep_until(startup_logo_deadline), if startup_logo_visible => {
                     startup_logo_visible = false;
                 }
-                action = rx.recv() => if self.initializing || startup_logo_visible {
+                action = rx.recv() => {
+                    let action = match action {
+                        Some(Action::Key(key)) => {
+                            if self.recipe_prompt.is_some() {
+                                self.handle_recipe_key(key, tx.clone());
+                                continue;
+                            }
+                            let Some(action) = Action::from_key(key.code) else { continue; };
+                            Some(action)
+                        }
+                        action => action,
+                    };
+                    if self.initializing || startup_logo_visible {
                     match action {
                         Some(Action::Quit) | None => break,
                         Some(action) => { let _ = self.handle_background_action(action, tx.clone()); }
@@ -202,11 +352,11 @@ impl AppState {
                         Action::Quit => break,
                         Action::Up => {
                             self.move_selection(-1);
-                            self.request_git_status(tx.clone());
+                            self.request_selected_details(tx.clone());
                         }
                         Action::Down => {
                             self.move_selection(1);
-                            self.request_git_status(tx.clone());
+                            self.request_selected_details(tx.clone());
                         }
                         Action::Left => {
                             if self.selected_has_children() { self.expanded.remove(&self.selected); }
@@ -225,6 +375,7 @@ impl AppState {
                         }
                         Action::Test => self.run_command(CommandKind::Test, tx.clone()),
                         Action::Lint => self.run_command(CommandKind::Lint, tx.clone()),
+                        Action::JustPrompt => self.open_recipe_prompt(tx.clone()),
                         Action::Refresh => self.request_project_scan(tx.clone()),
                         action => { let _ = self.handle_background_action(action, tx.clone()); }
                     }},
@@ -233,6 +384,10 @@ impl AppState {
                     }
                     (Some(popup), Some(Action::Lint)) if popup.success.is_some() => {
                         self.run_command(CommandKind::Lint, tx.clone());
+                    }
+                    (Some(popup), Some(Action::JustPrompt)) if popup.success.is_some() => {
+                        self.close_command_popup();
+                        self.open_recipe_prompt(tx.clone());
                     }
                     (Some(_), Some(action)) => match action {
                         Action::Quit | Action::Cancel => {
@@ -245,7 +400,7 @@ impl AppState {
                         action => { let _ = self.handle_background_action(action, tx.clone()); }
                     },
                     (_, None) => break,
-                }},
+                }}},
                 _ = sessions_tick.tick() => self.request_sessions_refresh(tx.clone()),
                 _ = tick.tick(), if self.loading => self.spinner = (self.spinner + 1) % 6,
             }
@@ -311,6 +466,31 @@ impl AppState {
                     }
                 }
             }
+            Action::JustRecipesLoaded { generation, path, result } => {
+                if let Some(prompt) = self.recipe_prompt.as_mut()
+                    && generation == prompt.generation
+                    && path == prompt.path
+                {
+                    let listing = match &result {
+                        Ok(Some(listing)) => Some(listing.clone()),
+                        Ok(None) => {
+                            prompt.error = Some("No justfile in this project".into());
+                            Some(String::new())
+                        }
+                        Err(error) => {
+                            prompt.error = Some(format!("Could not list recipes: {error}"));
+                            Some(String::new())
+                        }
+                    };
+                    prompt.update_listing(listing);
+                }
+                if generation == self.git_status_generation && path == self.selected {
+                    self.just_listing = match result {
+                        Ok(listing) => listing,
+                        Err(error) => Some(format!("  Could not list recipes: {error}")),
+                    };
+                }
+            }
             Action::ProjectsCached { repositories } => {
                 if let Some(repositories) = repositories {
                     self.repositories = repositories;
@@ -321,7 +501,7 @@ impl AppState {
                         .map(|row| row.path.clone())
                         .unwrap_or_else(|| self.home.clone());
                     self.initializing = false;
-                    self.request_git_status(tx.clone());
+                    self.request_selected_details(tx.clone());
                 }
                 self.request_project_scan(tx);
             }
@@ -350,7 +530,7 @@ impl AppState {
                                     .map(|row| row.path.clone())
                                     .unwrap_or_else(|| self.home.clone());
                             }
-                            self.request_git_status(tx.clone());
+                            self.request_selected_details(tx.clone());
                             self.status = "Projects refreshed".into();
                         }
                         Err(error) => self.status = format!("Project scan failed: {error}"),
@@ -424,10 +604,11 @@ impl AppState {
         });
     }
 
-    fn request_git_status(&mut self, tx: Sender<Action>) {
+    fn request_selected_details(&mut self, tx: Sender<Action>) {
         self.git_status_generation += 1;
         let generation = self.git_status_generation;
         let path = self.selected.clone();
+        self.just_listing = None;
         if self.project_at(&path).is_none() {
             self.git_status = None;
             self.git_status_loading = false;
@@ -436,6 +617,19 @@ impl AppState {
         let cached = self.git_status_cache.get(&path).cloned();
         self.git_status = cached.clone();
         self.git_status_loading = cached.is_none();
+        let just_path = path.clone();
+        let just_tx = tx.clone();
+        tokio::spawn(async move {
+            let load_path = just_path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || crate::backend::just::list_recipes(&load_path))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+            let _ = just_tx
+                .send(Action::JustRecipesLoaded { generation, path: just_path, result })
+                .await;
+        });
         let load_path = path.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || GitStatus::load(&load_path))
@@ -471,6 +665,7 @@ impl AppState {
                 | Action::Done
                 | Action::SessionsLoaded { .. }
                 | Action::GitStatusLoaded { .. }
+                | Action::JustRecipesLoaded { .. }
                 | Action::ProjectsCached { .. }
                 | Action::ProjectsLoaded { .. }
                 | Action::CommandOutput { .. }
@@ -588,12 +783,155 @@ impl AppState {
         self.command_generation += 1;
     }
 
+    fn open_recipe_prompt(&mut self, tx: Sender<Action>) {
+        if self.selected_project().is_none() {
+            self.status = "Select a project to run Just recipes".into();
+            return;
+        }
+        let Some(justfile) = crate::backend::just::justfile(&self.selected) else {
+            self.status = "No justfile in this project".into();
+            return;
+        };
+        let listing = self
+            .just_listing
+            .clone()
+            .filter(|listing| !listing.trim_start().starts_with("Could not list recipes:"));
+        self.request_selected_details(tx);
+        self.recipe_prompt = Some(RecipePrompt::new(
+            self.selected.clone(),
+            justfile,
+            self.git_status_generation,
+            listing,
+        ));
+    }
+
+    fn handle_recipe_key(&mut self, key: KeyEvent, tx: Sender<Action>) {
+        if key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.recipe_prompt = None;
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            self.submit_recipe(tx);
+            return;
+        }
+        let Some(prompt) = self.recipe_prompt.as_mut() else {
+            return;
+        };
+        prompt.error = None;
+        let previous_matches = prompt.filtered_recipes();
+        let previous_input = prompt.input.clone();
+        match key.code {
+            KeyCode::Up => {
+                prompt.move_recipe(-1);
+                return;
+            }
+            KeyCode::Down => {
+                prompt.move_recipe(1);
+                return;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                prompt.editing_arguments = !prompt.editing_arguments;
+                return;
+            }
+            _ => {}
+        }
+        let (input, cursor) = if prompt.editing_arguments {
+            (&mut prompt.arguments, &mut prompt.argument_cursor)
+        } else {
+            (&mut prompt.input, &mut prompt.cursor)
+        };
+        match key.code {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.clear();
+                *cursor = 0;
+            }
+            KeyCode::Home => *cursor = 0,
+            KeyCode::End => *cursor = input.len(),
+            KeyCode::Left => {
+                *cursor = input[..*cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+            }
+            KeyCode::Right => {
+                if let Some(character) = input[*cursor..].chars().next() {
+                    *cursor += character.len_utf8();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some((index, _)) = input[..*cursor].char_indices().next_back() {
+                    input.drain(index..*cursor);
+                    *cursor = index;
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(character) = input[*cursor..].chars().next() {
+                    input.drain(*cursor..*cursor + character.len_utf8());
+                }
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                input.insert(*cursor, character);
+                *cursor += character.len_utf8();
+            }
+            _ => {}
+        }
+        if prompt.input != previous_input {
+            prompt.filter_changed(&previous_matches);
+        }
+    }
+
+    fn submit_recipe(&mut self, tx: Sender<Action>) {
+        let Some(prompt) = self.recipe_prompt.as_mut() else {
+            return;
+        };
+        prompt.reconcile_selection();
+        let Some((_, recipe)) = prompt
+            .filtered_recipes()
+            .into_iter()
+            .find(|(index, _)| Some(*index) == prompt.selected)
+        else {
+            prompt.error = Some("No matching recipe selected".into());
+            return;
+        };
+        let input = format!("{} {}", shell_words::quote(&recipe.name), prompt.arguments);
+        let command = match crate::backend::just::recipe_command(&prompt.justfile, &input) {
+            Ok(command) => command,
+            Err(error) => {
+                prompt.error = Some(error);
+                return;
+            }
+        };
+        let prompt = self.recipe_prompt.take().unwrap();
+        let title = format!("Just: {}", input.trim_end());
+        self.run_commands(prompt.path, title, vec![command], tx);
+    }
+
     fn run_command(&mut self, command: CommandKind, tx: Sender<Action>) {
         let Some(project) = self.selected_project() else {
             return;
         };
         let project = project.clone();
         let title = command.title().to_string();
+        let commands = project
+            .commands(command)
+            .iter()
+            .map(|command| command.iter().map(|arg| (*arg).to_owned()).collect())
+            .collect();
+        self.run_commands(project.path, title, commands, tx);
+    }
+
+    fn run_commands(
+        &mut self,
+        path: PathBuf,
+        title: String,
+        commands: Vec<Vec<String>>,
+        tx: Sender<Action>,
+    ) {
         self.command_generation += 1;
         let generation = self.command_generation;
         self.command_popup = Some(CommandPopup {
@@ -609,7 +947,7 @@ impl AppState {
         let output_tx = tx.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                execute_commands_streaming(&project, command, generation, output_tx, &cancelled)
+                execute_commands_streaming(&path, &commands, generation, output_tx, &cancelled)
             })
             .await
             .unwrap_or_else(|error| (format!("Command task failed: {error}"), false));
@@ -654,7 +992,7 @@ impl AppState {
             .find(|path| visible.iter().any(|row| row.path == *path))
             .or_else(|| visible.first().map(|row| row.path.clone()))
             .unwrap_or_else(|| self.home.clone());
-            self.request_git_status(tx);
+            self.request_selected_details(tx);
         }
     }
 
@@ -744,13 +1082,12 @@ async fn wait(tx: Sender<Action>) {
 }
 
 fn execute_commands_streaming(
-    project: &Project,
-    command: CommandKind,
+    path: &Path,
+    commands: &[Vec<String>],
     generation: u64,
     tx: Sender<Action>,
     cancelled: &AtomicBool,
 ) -> (String, bool) {
-    let commands = project.commands(command);
     if commands.is_empty() {
         return ("No test or lint command is defined for this project.".into(), false);
     }
@@ -760,12 +1097,13 @@ fn execute_commands_streaming(
         if cancelled.load(Ordering::Relaxed) {
             return (output, false);
         }
-        let header = format!("$ {}\n", command.join(" "));
+        let header = format!("$ {}\n", shell_words::join(command));
         output.push_str(&header);
         if !send_command_output(&tx, generation, header, cancelled) {
             return (output, false);
         }
-        match runner::execute(&project.path, &command, cancelled, |chunk| {
+        let args: Vec<_> = command.iter().map(String::as_str).collect();
+        match runner::execute(path, &args, cancelled, |chunk| {
             send_command_output(&tx, generation, chunk, cancelled)
         }) {
             Ok((command_output, command_success)) => {
@@ -885,6 +1223,258 @@ mod tests {
         state.handle_window_shortcut(Action::OpenWindowPrefix);
         assert!(!state.open_window_pending);
         assert!(state.status.starts_with("No running session"));
+    }
+
+    #[test]
+    fn just_listing_rejects_stale_results_and_clears_when_justfile_is_missing() {
+        let (home, repositories, _, _) = tree();
+        let mut state =
+            AppState::new(home, repositories, SessionBackend::default(), Settings::default(), None);
+        state.git_status_generation = 5;
+        state.just_listing = Some("current".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        for (generation, path) in [(4, state.selected.clone()), (5, state.home.join("other"))] {
+            state
+                .handle_background_action(
+                    Action::JustRecipesLoaded {
+                        generation,
+                        path,
+                        result: Ok(Some("stale".into())),
+                    },
+                    tx.clone(),
+                )
+                .unwrap();
+            assert_eq!(state.just_listing.as_deref(), Some("current"));
+        }
+        state
+            .handle_background_action(
+                Action::JustRecipesLoaded {
+                    generation: 5,
+                    path: state.selected.clone(),
+                    result: Ok(None),
+                },
+                tx,
+            )
+            .unwrap();
+        assert!(state.just_listing.is_none());
+    }
+
+    #[test]
+    fn recipe_prompt_edits_text_instead_of_triggering_project_shortcuts() {
+        let (home, repositories, _, _) = tree();
+        let mut state =
+            AppState::new(home, repositories, SessionBackend::default(), Settings::default(), None);
+        let selected = state.selected.clone();
+        state.recipe_prompt = Some(RecipePrompt::new(
+            selected.clone(),
+            selected.join("justfile"),
+            0,
+            Some("  test\n  lint".into()),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        for character in "qtlé".chars() {
+            state.handle_recipe_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                tx.clone(),
+            );
+        }
+        for code in [
+            KeyCode::Left,
+            KeyCode::Backspace,
+            KeyCode::Char('-'),
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::Delete,
+        ] {
+            state.handle_recipe_key(KeyEvent::new(code, KeyModifiers::NONE), tx.clone());
+        }
+        assert_eq!(state.recipe_prompt.as_ref().unwrap().input, "t-é");
+        state.handle_recipe_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), tx.clone());
+        state.handle_recipe_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), tx.clone());
+        assert_eq!(state.recipe_prompt.as_ref().unwrap().input, "t-");
+        state.handle_recipe_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), tx.clone());
+        assert_eq!(state.selected, selected);
+        assert!(state.recipe_prompt.as_ref().unwrap().selected.is_none());
+        state.handle_recipe_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx.clone());
+        assert!(state.recipe_prompt.as_ref().unwrap().error.is_some());
+        assert!(state.command_popup.is_none());
+        state.handle_recipe_key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            tx.clone(),
+        );
+        state.handle_recipe_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), tx.clone());
+        assert_eq!(state.recipe_prompt.as_ref().unwrap().selected, Some(0));
+        state.handle_recipe_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), tx.clone());
+        state.handle_recipe_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), tx.clone());
+        assert_eq!(state.recipe_prompt.as_ref().unwrap().arguments, "x");
+        assert!(state.recipe_prompt.as_ref().unwrap().input.is_empty());
+        state.handle_recipe_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx);
+        assert!(state.recipe_prompt.is_none());
+    }
+
+    #[test]
+    fn recipe_picker_uses_stable_order_and_name_highlights() {
+        let scenarios = [
+            (
+                "  check # Run tests and lint\n  lint # Lint\n  test # Run tests",
+                "te",
+                0,
+                0,
+                Some("test"),
+            ),
+            ("  check # Run tests and lint\n  test # Run tests", "test", 0, 0, Some("test")),
+            (
+                "  check # Run tests and lint\n  lint # Lint\n  test # Run tests",
+                "t",
+                0,
+                0,
+                Some("test"),
+            ),
+            ("  check # Run tests\n  test-unit\n  test", "t", 0, 1, Some("test-unit")),
+            ("  test-unit\n  test\n  test-integration", "test", 0, 1, Some("test-integration")),
+            (
+                "  build # Compile application\n  check # Run tests and lint\n  test # Run tests",
+                "run tests",
+                0,
+                0,
+                Some("check"),
+            ),
+            (
+                "  alpha # apples\n  bravo # bananas\n  charlie # apples\n  delta # bananas\n  echo # apples",
+                "apls",
+                3,
+                0,
+                Some("charlie"),
+            ),
+            ("  deploy target\n  deploy-preview", "deploy staging", 0, 0, None),
+        ];
+        for (listing, query, before, after, expected) in scenarios {
+            let (home, repositories, _, _) = tree();
+            let mut state = AppState::new(
+                home,
+                repositories,
+                SessionBackend::default(),
+                Settings::default(),
+                None,
+            );
+            state.recipe_prompt = Some(RecipePrompt::new(
+                state.selected.clone(),
+                state.selected.join("justfile"),
+                0,
+                Some(listing.into()),
+            ));
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+            for _ in 0..before {
+                state.handle_recipe_key(down, tx.clone());
+            }
+            for character in query.chars() {
+                state.handle_recipe_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    tx.clone(),
+                );
+            }
+            for _ in 0..after {
+                state.handle_recipe_key(down, tx.clone());
+            }
+            // Moving the text cursor must not undo a manual recipe selection.
+            state.handle_recipe_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), tx.clone());
+            let prompt = state.recipe_prompt.as_ref().unwrap();
+            let matches = prompt.filtered_recipes();
+            assert!(
+                matches.windows(2).all(|pair| pair[0].1.name <= pair[1].1.name),
+                "filter must not reorder matches by relevance: {query}"
+            );
+            let selected = matches.iter().find(|(index, _)| Some(*index) == prompt.selected);
+            assert_eq!(
+                selected.map(|(_, recipe)| recipe.name.as_str()),
+                expected,
+                "query: {query}"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(
+                    crate::backend::just::recipe_command(
+                        &prompt.justfile,
+                        &selected.unwrap().1.name
+                    )
+                    .unwrap()
+                    .last()
+                    .unwrap(),
+                    expected
+                );
+            } else {
+                state.handle_recipe_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx);
+                assert!(state.command_popup.is_none());
+                assert!(state.recipe_prompt.as_ref().unwrap().error.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn exact_match_is_highlighted_when_recipes_finish_loading() {
+        let mut prompt = RecipePrompt::new(
+            PathBuf::from("/tmp/project"),
+            PathBuf::from("/tmp/project/justfile"),
+            0,
+            None,
+        );
+        prompt.input = "TEST".into();
+        prompt.cursor = prompt.input.len();
+        prompt.update_listing(Some("  check # Run tests\n  test # Run tests".into()));
+        assert_eq!(
+            prompt
+                .filtered_recipes()
+                .iter()
+                .map(|(_, recipe)| recipe.name.as_str())
+                .collect::<Vec<_>>(),
+            ["check", "test"]
+        );
+        assert_eq!(prompt.selected, Some(1));
+        prompt.move_recipe(-1);
+        prompt.update_listing(Some("  check # Run tests\n  test # Run tests".into()));
+        assert_eq!(prompt.selected, Some(0)); // Refresh must not undo arrow navigation.
+    }
+
+    #[test]
+    fn filtering_preserves_selection_or_moves_to_nearest_surviving_recipe_above() {
+        let mut prompt = RecipePrompt::new(PathBuf::from("/tmp/project"), PathBuf::from("/tmp/project/justfile"), 0,
+            Some("  alpha # apples\n  bravo # bananas\n  charlie # apples\n  delta # bananas\n  echo # apples".into()));
+        for _ in 0..3 {
+            prompt.move_recipe(1);
+        }
+        assert_eq!(prompt.selected, Some(3));
+        prompt.input = "APLS".into();
+        prompt.reconcile_selection();
+        assert_eq!(
+            prompt.filtered_recipes().iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+        assert_eq!(prompt.selected, Some(2));
+        prompt.input = "apls chrl".into();
+        prompt.reconcile_selection();
+        assert_eq!(prompt.selected, Some(2));
+        prompt.input = "ech".into();
+        prompt.reconcile_selection();
+        assert_eq!(prompt.selected, Some(4)); // No match above: first surviving match.
+        prompt.input.clear();
+        prompt.reconcile_selection();
+        assert_eq!(prompt.selected, Some(4)); // Broadening preserves the active recipe.
+        prompt.input = "no recipe matches this".into();
+        prompt.reconcile_selection();
+        assert!(prompt.selected.is_none());
+        prompt.move_recipe(-1);
+        assert!(prompt.selected.is_none());
+        prompt.input.clear();
+        prompt.reconcile_selection();
+        assert_eq!(prompt.selected, Some(0));
+        prompt.move_recipe(-1);
+        assert_eq!(prompt.selected, Some(0));
+        prompt.move_recipe(1);
+        assert_eq!(prompt.selected, Some(1));
+        prompt.update_listing(Some(
+            "  alpha # apples\n  beta # new recipe\n  bravo # bananas".into(),
+        ));
+        assert_eq!(prompt.selected, Some(2)); // Refreshes preserve recipe identity.
     }
 
     #[tokio::test]

@@ -2,6 +2,8 @@ use crossterm::event::KeyCode;
 
 #[derive(Debug)]
 pub enum Action {
+    Key(crossterm::event::KeyEvent),
+    JustPrompt,
     Quit,
     Wait,
     Done,
@@ -40,6 +42,11 @@ pub enum Action {
         generation: u64,
         result: Result<Vec<crate::backend::sessions::Session>, String>,
     },
+    JustRecipesLoaded {
+        generation: u64,
+        path: std::path::PathBuf,
+        result: Result<Option<String>, String>,
+    },
     ProjectsCached {
         repositories: Option<Vec<crate::backend::Repository>>,
     },
@@ -62,6 +69,7 @@ impl Action {
     pub fn from_key(code: KeyCode) -> Option<Self> {
         Some(match code {
             KeyCode::Char('q') => Self::Quit,
+            KeyCode::Char(':') => Self::JustPrompt,
             KeyCode::Char('w') => Self::Wait,
             KeyCode::Char('r') => Self::Refresh,
             KeyCode::Up => Self::Up,
