@@ -33,6 +33,19 @@ pub struct CommandPopup {
     pub success: Option<bool>,
 }
 
+/// fzf-style project search state.
+#[derive(Default)]
+pub struct FuzzySearch {
+    pub query: String,
+    pub selected: usize,
+}
+
+pub struct FuzzyResult {
+    pub path: PathBuf,
+    pub display: String,
+    pub positions: Vec<usize>,
+}
+
 pub struct RecipePrompt {
     pub path: PathBuf,
     pub justfile: PathBuf,
@@ -210,6 +223,7 @@ pub struct AppState {
     pub project_scan_pending: bool,
     pub command_popup: Option<CommandPopup>,
     pub recipe_prompt: Option<RecipePrompt>,
+    pub fuzzy: Option<FuzzySearch>,
     pub command_generation: u64,
     pub command_cancellation: Option<CommandCancellation>,
     pub git_status: Option<GitStatus>,
@@ -252,6 +266,7 @@ impl AppState {
             project_scan_pending: false,
             command_popup: None,
             recipe_prompt: None,
+            fuzzy: None,
             command_generation: 0,
             command_cancellation: None,
             git_status: None,
@@ -318,6 +333,10 @@ impl AppState {
                                 self.handle_recipe_key(key, tx.clone());
                                 continue;
                             }
+                            if self.fuzzy.is_some() {
+                                self.handle_fuzzy_key(key, tx.clone());
+                                continue;
+                            }
                             let Some(action) = Action::from_key(key.code) else { continue; };
                             Some(action)
                         }
@@ -376,6 +395,7 @@ impl AppState {
                         Action::Test => self.run_command(CommandKind::Test, tx.clone()),
                         Action::Lint => self.run_command(CommandKind::Lint, tx.clone()),
                         Action::JustPrompt => self.open_recipe_prompt(tx.clone()),
+                        Action::Search => self.fuzzy = Some(FuzzySearch::default()),
                         Action::Refresh => self.request_project_scan(tx.clone()),
                         action => { let _ = self.handle_background_action(action, tx.clone()); }
                     }},
@@ -803,6 +823,99 @@ impl AppState {
             self.git_status_generation,
             listing,
         ));
+    }
+
+    /// Ranks projects (by path relative to Home) against the current query.
+    pub fn fuzzy_results(&self) -> Vec<FuzzyResult> {
+        let Some(search) = &self.fuzzy else { return Vec::new() };
+        let mut results: Vec<(i64, FuzzyResult)> = self
+            .repositories
+            .iter()
+            .flat_map(|repo| &repo.projects)
+            .filter(|project| {
+                self.show_hidden
+                    || !project
+                        .path
+                        .ancestors()
+                        .take_while(|a| a.starts_with(&self.home) && *a != self.home)
+                        .any(|a| self.settings.display_for(a) == DisplayMode::Hidden)
+            })
+            .filter_map(|project| {
+                let display = project
+                    .path
+                    .strip_prefix(&self.home)
+                    .unwrap_or(&project.path)
+                    .display()
+                    .to_string();
+                let found = crate::fuzzy::fuzzy_match(&search.query, &display)?;
+                Some((
+                    found.score,
+                    FuzzyResult { path: project.path.clone(), display, positions: found.positions },
+                ))
+            })
+            .collect();
+        results.sort_by(|(a, left), (b, right)| {
+            b.cmp(a)
+                .then(left.display.len().cmp(&right.display.len()))
+                .then(left.display.cmp(&right.display))
+        });
+        results.into_iter().map(|(_, result)| result).collect()
+    }
+
+    fn handle_fuzzy_key(&mut self, key: KeyEvent, tx: Sender<Action>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let count = self.fuzzy_results().len();
+        let Some(search) = self.fuzzy.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => self.fuzzy = None,
+            KeyCode::Char('c' | 'g') if ctrl => self.fuzzy = None,
+            KeyCode::Enter => {
+                let index = search.selected;
+                let target = self.fuzzy_results().into_iter().nth(index);
+                self.fuzzy = None;
+                if let Some(target) = target {
+                    self.select_path(target.path, tx);
+                }
+            }
+            KeyCode::Up | KeyCode::BackTab => search.selected = search.selected.saturating_sub(1),
+            KeyCode::Char('p' | 'k') if ctrl => search.selected = search.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => {
+                search.selected = (search.selected + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Char('n' | 'j') if ctrl => {
+                search.selected = (search.selected + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Char('u') if ctrl => {
+                search.query.clear();
+                search.selected = 0;
+            }
+            KeyCode::Char('w') if ctrl => {
+                let trimmed = search.query.trim_end().len();
+                let start = search.query[..trimmed].rfind(' ').map_or(0, |i| i + 1);
+                search.query.truncate(start);
+                search.selected = 0;
+            }
+            KeyCode::Backspace => {
+                search.query.pop();
+                search.selected = 0;
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                search.query.push(character);
+                search.selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Selects a project, expanding its ancestors so it is visible in the tree.
+    fn select_path(&mut self, path: PathBuf, tx: Sender<Action>) {
+        for ancestor in path.ancestors().skip(1).take_while(|a| a.starts_with(&self.home)) {
+            self.expanded.insert(ancestor.to_path_buf());
+        }
+        self.selected = path;
+        self.request_selected_details(tx);
     }
 
     fn handle_recipe_key(&mut self, key: KeyEvent, tx: Sender<Action>) {

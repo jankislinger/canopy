@@ -3,6 +3,7 @@ mod app;
 mod backend;
 mod config;
 mod event;
+mod fuzzy;
 mod ui;
 
 use std::sync::{

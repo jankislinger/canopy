@@ -155,7 +155,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
         Paragraph::new(vec![
             Line::from("Enter: switch  o0–9: window  s: start  x: stop"),
             Line::from("t: test  l: lint  :: Just  r: refresh  H: hidden"),
-            Line::from("Esc: close popup  q: quit"),
+            Line::from("/: find  Esc: close popup  q: quit"),
             Line::from(if s.confirmation.is_some() { "Confirm stop: y/n" } else { &s.status }),
         ])
         .block(Block::bordered().title("Commands")),
@@ -297,6 +297,9 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
             ));
         }
     }
+    if s.fuzzy.is_some() {
+        draw_fuzzy(f, s);
+    }
     if s.tmux_warning {
         let area = centered_rect(70, 9, f.area());
         f.render_widget(Clear, area);
@@ -318,6 +321,66 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
             area,
         );
     }
+}
+
+/// Draws the fzf-style project finder: results above, prompt below.
+fn draw_fuzzy(f: &mut ratatui::Frame, s: &AppState) {
+    let results = s.fuzzy_results();
+    let query = s.fuzzy.as_ref().map(|search| search.query.as_str()).unwrap_or("");
+    let selected = s.fuzzy.as_ref().map_or(0, |search| search.selected);
+    let area = centered_rect(80, f.area().height.saturating_sub(4).clamp(5, 20), f.area());
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(format!(
+            "Find project {}/{}",
+            results.len(),
+            s.repositories.iter().map(|r| r.projects.len()).sum::<usize>()
+        ))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let items = results
+        .iter()
+        .map(|result| {
+            let spans = result
+                .display
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    if result.positions.contains(&index) {
+                        Span::styled(
+                            character.to_string(),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::raw(character.to_string())
+                    }
+                })
+                .collect::<Vec<_>>();
+            ListItem::new(Line::from(spans))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ratatui::widgets::ListState::default();
+    state.select((!items.is_empty()).then_some(selected.min(items.len() - 1)));
+    f.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().bg(Color::DarkGray))
+            .scroll_padding(1),
+        sections[0],
+        &mut state,
+    );
+    f.render_widget(
+        Paragraph::new(format!("/ {query}")).style(Style::default().fg(Color::Cyan)),
+        sections[1],
+    );
+    f.set_cursor_position((
+        sections[1].x
+            + (Line::from(format!("/ {query}")).width() as u16)
+                .min(sections[1].width.saturating_sub(1)),
+        sections[1].y,
+    ));
 }
 
 fn truncate_project_name(text: &str, width: usize) -> String {
@@ -475,6 +538,7 @@ mod tests {
             project_scan_pending: false,
             command_popup: None,
             recipe_prompt: None,
+            fuzzy: None,
             command_generation: 0,
             command_cancellation: None,
             git_status: Some(GitStatus {

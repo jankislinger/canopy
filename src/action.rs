@@ -4,6 +4,7 @@ use crossterm::event::KeyCode;
 pub enum Action {
     Key(crossterm::event::KeyEvent),
     JustPrompt,
+    Search,
     Quit,
     Wait,
     Done,
@@ -70,6 +71,7 @@ impl Action {
         Some(match code {
             KeyCode::Char('q') => Self::Quit,
             KeyCode::Char(':') => Self::JustPrompt,
+            KeyCode::Char('/') => Self::Search,
             KeyCode::Char('w') => Self::Wait,
             KeyCode::Char('r') => Self::Refresh,
             KeyCode::Up => Self::Up,
