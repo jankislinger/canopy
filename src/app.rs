@@ -312,7 +312,7 @@ impl AppState {
         let mut sessions_tick = time::interval(Duration::from_secs(1));
         sessions_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         sessions_tick.tick().await;
-        let startup_logo_deadline = time::Instant::now() + Duration::from_secs(2);
+        let startup_logo_deadline = time::Instant::now() + Duration::from_secs(1);
         let mut startup_logo_visible = self.initializing;
         loop {
             terminal.draw(|f| {
