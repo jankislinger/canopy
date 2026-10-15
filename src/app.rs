@@ -314,6 +314,10 @@ impl AppState {
         sessions_tick.tick().await;
         let startup_logo_deadline = time::Instant::now() + Duration::from_secs(1);
         let mut startup_logo_visible = self.initializing;
+        // Actions pulled from the channel while coalescing navigation keys.
+        let mut stash: Option<Action> = None;
+        // When set, selected-project details are loaded once this instant passes.
+        let mut details_deadline: Option<time::Instant> = None;
         loop {
             terminal.draw(|f| {
                 if startup_logo_visible {
@@ -326,7 +330,18 @@ impl AppState {
                 _ = time::sleep_until(startup_logo_deadline), if startup_logo_visible => {
                     startup_logo_visible = false;
                 }
-                action = rx.recv() => {
+                _ = async { time::sleep_until(details_deadline.unwrap()).await },
+                    if details_deadline.is_some() =>
+                {
+                    details_deadline = None;
+                    self.request_selected_details(tx.clone());
+                }
+                action = async {
+                    match stash.take() {
+                        Some(action) => Some(action),
+                        None => rx.recv().await,
+                    }
+                } => {
                     let action = match action {
                         Some(Action::Key(key)) => {
                             if self.recipe_prompt.is_some() {
@@ -338,6 +353,39 @@ impl AppState {
                                 continue;
                             }
                             let Some(action) = Action::from_key(key.code) else { continue; };
+                            if matches!(action, Action::Up | Action::Down)
+                                && self.can_coalesce_navigation()
+                            {
+                                // Merge queued Up/Down presses into one move so a key-repeat
+                                // backlog cannot keep scrolling after the key is released.
+                                let mut delta = nav_step(&action);
+                                while let Ok(next) = rx.try_recv() {
+                                    match next {
+                                        Action::Key(key)
+                                            if matches!(
+                                                Action::from_key(key.code),
+                                                Some(Action::Up | Action::Down)
+                                            ) =>
+                                        {
+                                            delta += nav_step(&Action::from_key(key.code).unwrap());
+                                        }
+                                        other => {
+                                            stash = Some(other);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(popup) = self.command_popup.as_mut() {
+                                    popup.scroll(delta.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+                                } else {
+                                    self.move_selection(delta);
+                                    self.preview_selected_details();
+                                    details_deadline = Some(
+                                        time::Instant::now() + Duration::from_millis(120),
+                                    );
+                                }
+                                continue;
+                            }
                             Some(action)
                         }
                         action => action,
@@ -622,6 +670,29 @@ impl AppState {
             .and_then(|result| result);
             let _ = tx.send(Action::SessionsLoaded { generation, result }).await;
         });
+    }
+
+    /// True when Up/Down are plain navigation, with no modal state intercepting them.
+    fn can_coalesce_navigation(&self) -> bool {
+        !self.initializing
+            && self.error_popup.is_none()
+            && !self.tmux_warning
+            && self.confirmation.is_none()
+            && !self.open_window_pending
+    }
+
+    /// Cheaply shows cached details for the selection and invalidates in-flight loads.
+    fn preview_selected_details(&mut self) {
+        self.git_status_generation += 1;
+        self.just_listing = None;
+        if self.project_at(&self.selected).is_none() {
+            self.git_status = None;
+            self.git_status_loading = false;
+            return;
+        }
+        let cached = self.git_status_cache.get(&self.selected).cloned();
+        self.git_status_loading = cached.is_none();
+        self.git_status = cached;
     }
 
     fn request_selected_details(&mut self, tx: Sender<Action>) {
@@ -1186,6 +1257,10 @@ impl AppState {
         }
         expanded
     }
+}
+
+fn nav_step(action: &Action) -> i32 {
+    if matches!(action, Action::Up) { -1 } else { 1 }
 }
 
 /// Sends a completion action after the demonstration delay.
