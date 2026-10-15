@@ -16,7 +16,7 @@ The application currently:
 - detects nested Python and Rust projects using `pyproject.toml` and `Cargo.toml`;
 - displays a filesystem-style project tree with Git/Python/Rust indicators;
 - supports arrow-key navigation and directory expansion/collapse;
-- creates persistent tmux project sessions with editor, agent, and terminal windows;
+- creates persistent tmux project sessions with editor, agent, terminal, and git (`lazygit`) windows;
 - switches to the selected project's last active tmux window with `Enter` (creating its session if needed);
 - shows running/attached sessions and their windows in Details, refreshed every second;
 - lists the selected project's Just recipes, including parameters and descriptions, in Details when it has a justfile;

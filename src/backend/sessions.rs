@@ -85,7 +85,8 @@ impl SessionBackend {
 
     /// Creates a detached project session rooted at `project_path`.
     ///
-    /// The first two tmux windows run the supplied editor and agent commands.
+    /// The first two tmux windows run the supplied editor and agent commands,
+    /// followed by a shell window and a `git` window running `lazygit`.
     pub fn create(
         &self,
         project_path: &Path,
@@ -126,6 +127,18 @@ impl SessionBackend {
             "-c".into(),
             path.display().to_string(),
         ])?;
+        self.command_owned(vec![
+            "new-window".into(),
+            "-t".into(),
+            name.clone(),
+            "-n".into(),
+            "git".into(),
+            "-c".into(),
+            path.display().to_string(),
+            "lazygit".into(),
+        ])?;
+        // `new-window` activates the window it creates; start from the first one.
+        self.command_owned(vec!["select-window".into(), "-t".into(), format!("={name}:^")])?;
         Ok(name)
     }
 
