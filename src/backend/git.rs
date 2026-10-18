@@ -38,15 +38,15 @@ impl GitStatus {
             .find(|candidate| candidate.join(".git").exists())
             .ok_or_else(|| "Not in a Git repository".to_string())?
             .to_path_buf();
-        let branch = git(&repository, ["branch", "--show-current"])
+        let branch = git(&repository, &["branch", "--show-current"])
             .map(|branch| if branch.is_empty() { "HEAD".into() } else { branch })?;
-        let user_email = git(&repository, ["config", "--get", "user.email"]).unwrap_or_default();
-        let user_name = git(&repository, ["config", "--get", "user.name"]).unwrap_or_default();
-        let log = git(&repository, ["log", "-6", "--format=%H%x1f%an%x1f%ae%x1f%s%x1f%ar%x1e"])?;
+        let user_email = git(&repository, &["config", "--get", "user.email"]).unwrap_or_default();
+        let user_name = git(&repository, &["config", "--get", "user.name"]).unwrap_or_default();
+        let log = recent_log(&repository, path)?;
         let commits = GitCommit::parse_log(&log, &user_email, &user_name);
-        let all_changes = git(&repository, ["status", "--porcelain=v1", "--untracked-files=all"])?;
+        let all_changes = git(&repository, &["status", "--porcelain=v1", "--untracked-files=all"])?;
         let project_changes =
-            git(path, ["status", "--porcelain=v1", "--untracked-files=all", "--", "."])?;
+            git(path, &["status", "--porcelain=v1", "--untracked-files=all", "--", "."])?;
         let working_tree = if all_changes.is_empty() {
             WorkingTree::Clean
         } else if project_changes.is_empty() {
@@ -82,7 +82,18 @@ impl GitCommit {
     }
 }
 
-fn git<const N: usize>(repository: &Path, args: [&str; N]) -> Result<String, String> {
+const LOG_FORMAT: &str = "--format=%H%x1f%an%x1f%ae%x1f%s%x1f%ar%x1e";
+
+/// Recent history for the selected path. Nested projects only include commits that change that directory.
+fn recent_log(repository: &Path, path: &Path) -> Result<String, String> {
+    if path.components().eq(repository.components()) {
+        git(repository, &["log", "-6", LOG_FORMAT])
+    } else {
+        git(path, &["log", "-6", LOG_FORMAT, "--", "."])
+    }
+}
+
+fn git(repository: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(repository)
@@ -105,7 +116,12 @@ fn initials(author: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitCommit, initials};
+    use super::{GitCommit, GitStatus, initials};
+    use std::{
+        fs,
+        path::Path,
+        process::{Command, Stdio},
+    };
 
     #[test]
     fn derives_author_initials() {
@@ -128,5 +144,55 @@ mod tests {
             ["123456", "abcdef"]
         );
         assert!(commits.iter().all(|commit| commit.sha.chars().count() == 6));
+    }
+
+    #[test]
+    fn nested_project_lists_only_commits_that_touch_its_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "canopy-git-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let project = root.join("services").join("api");
+        fs::create_dir_all(&project).unwrap();
+        git_ok(&root, &["init", "-b", "main"]);
+        git_ok(&root, &["config", "user.email", "ada@example.com"]);
+        git_ok(&root, &["config", "user.name", "Ada Lovelace"]);
+        commit(&root, "README.md", "root only");
+        commit(&project, "main.rs", "api change");
+        commit(&root, "LICENSE", "another root change");
+
+        let nested = GitStatus::load(&project).unwrap();
+        let messages: Vec<_> =
+            nested.commits.iter().map(|commit| commit.message.as_str()).collect();
+        assert_eq!(messages, ["api change"]);
+
+        let repository = GitStatus::load(&root).unwrap();
+        let messages: Vec<_> =
+            repository.commits.iter().map(|commit| commit.message.as_str()).collect();
+        assert_eq!(messages, ["another root change", "api change", "root only"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn commit(directory: &Path, file: &str, message: &str) {
+        fs::write(directory.join(file), message).unwrap();
+        git_ok(directory, &["add", file]);
+        git_ok(directory, &["commit", "-m", message]);
+    }
+
+    fn git_ok(directory: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .env("GIT_AUTHOR_NAME", "Ada Lovelace")
+            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada Lovelace")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", directory.display());
     }
 }
