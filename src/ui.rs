@@ -155,7 +155,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
         Paragraph::new(vec![
             Line::from("Enter: switch  o0–9: window  s: start  x: stop"),
             Line::from("t: test  l: lint  :: Just  r: refresh  H: hidden"),
-            Line::from("/: find  Esc: close popup  q: quit"),
+            Line::from("/: find  a: sessions  Esc: close popup  q: quit"),
             Line::from(if s.confirmation.is_some() { "Confirm stop: y/n" } else { &s.status }),
         ])
         .block(Block::bordered().title("Commands")),
@@ -300,6 +300,9 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
     if s.fuzzy.is_some() {
         draw_fuzzy(f, s);
     }
+    if s.active_sessions.is_some() {
+        draw_active_sessions(f, s);
+    }
     if s.tmux_warning {
         let area = centered_rect(70, 9, f.area());
         f.render_widget(Clear, area);
@@ -321,6 +324,55 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
             area,
         );
     }
+}
+
+/// Draws projects that currently have a tmux session.
+fn draw_active_sessions(f: &mut ratatui::Frame, s: &AppState) {
+    let projects = s.active_session_projects();
+    let selected = s.active_sessions.as_ref().map(|popup| popup.selected).unwrap_or(0);
+    let list_rows = projects.len().clamp(1, 12) as u16;
+    let height = (list_rows + 3).min(f.area().height.saturating_sub(2)).max(5);
+    let area = centered_rect(70, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(format!("Active sessions ({})", projects.len()))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    if projects.is_empty() {
+        f.render_widget(Paragraph::new("No projects have an active session"), sections[0]);
+    } else {
+        let items = projects
+            .iter()
+            .map(|project| {
+                let windows = match project.window_count {
+                    1 => "1 window".to_owned(),
+                    count => format!("{count} windows"),
+                };
+                let status = if project.attached_clients > 0 {
+                    format!("attached ({})", project.attached_clients)
+                } else {
+                    "running".to_owned()
+                };
+                ListItem::new(Line::from(format!("{}  {status} · {windows}", project.display)))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(selected.min(items.len() - 1)));
+        f.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                .scroll_padding(1),
+            sections[0],
+            &mut state,
+        );
+    }
+    f.render_widget(
+        Paragraph::new("Enter: switch    Esc: close").style(Style::default().fg(Color::DarkGray)),
+        sections[1],
+    );
 }
 
 /// Draws the fzf-style project finder: results above, prompt below.
@@ -539,6 +591,7 @@ mod tests {
             command_popup: None,
             recipe_prompt: None,
             fuzzy: None,
+            active_sessions: None,
             command_generation: 0,
             command_cancellation: None,
             git_status: Some(GitStatus {
@@ -569,6 +622,57 @@ mod tests {
             sessions_refresh_generation: 0,
             sessions_refresh_pending: false,
         }
+    }
+
+    #[test]
+    fn active_sessions_popup_lists_projects_with_sessions() {
+        use crate::{
+            app::ActiveSessions,
+            backend::sessions::{Session, Window},
+        };
+        let mut state = test_state();
+        let running = PathBuf::from("/home/test/repo");
+        let attached = PathBuf::from("/home/test/repo/service");
+        let idle = PathBuf::from("/home/test/other");
+        state.repositories.push(Repository {
+            path: running.clone(),
+            projects: vec![
+                Project::new(running.clone(), vec![ProjectKind::Git], None),
+                Project::new(attached.clone(), vec![ProjectKind::Rust], None),
+                Project::new(idle.clone(), vec![ProjectKind::Python], None),
+            ],
+        });
+        state.sessions = vec![
+            Session {
+                name: Session::name_for_path(&running),
+                attached_clients: 0,
+                working_directory: running,
+                windows: vec![Window {
+                    index: 0,
+                    id: "@1".into(),
+                    name: "editor".into(),
+                    active: true,
+                    pane_count: 1,
+                    command: "nvim".into(),
+                    working_directory: PathBuf::from("/home/test/repo"),
+                }],
+            },
+            Session {
+                name: Session::name_for_path(&attached),
+                attached_clients: 2,
+                working_directory: attached,
+                windows: vec![],
+            },
+        ];
+        state.active_sessions = Some(ActiveSessions { selected: 1 });
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Active sessions (2)"));
+        assert!(text.contains("repo  running · 1 window"));
+        assert!(text.contains("repo/service  attached (2) · 0 windows"));
+        assert!(text.contains("Enter: switch"));
     }
 
     #[test]

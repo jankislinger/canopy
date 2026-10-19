@@ -40,6 +40,19 @@ pub struct FuzzySearch {
     pub selected: usize,
 }
 
+/// Popup that lists projects with a running tmux session.
+pub struct ActiveSessions {
+    pub selected: usize,
+}
+
+/// A project whose tmux session is currently running.
+pub struct ActiveSessionProject {
+    pub path: PathBuf,
+    pub display: String,
+    pub attached_clients: usize,
+    pub window_count: usize,
+}
+
 pub struct FuzzyResult {
     pub path: PathBuf,
     pub display: String,
@@ -224,6 +237,7 @@ pub struct AppState {
     pub command_popup: Option<CommandPopup>,
     pub recipe_prompt: Option<RecipePrompt>,
     pub fuzzy: Option<FuzzySearch>,
+    pub active_sessions: Option<ActiveSessions>,
     pub command_generation: u64,
     pub command_cancellation: Option<CommandCancellation>,
     pub git_status: Option<GitStatus>,
@@ -267,6 +281,7 @@ impl AppState {
             command_popup: None,
             recipe_prompt: None,
             fuzzy: None,
+            active_sessions: None,
             command_generation: 0,
             command_cancellation: None,
             git_status: None,
@@ -350,6 +365,10 @@ impl AppState {
                             }
                             if self.fuzzy.is_some() {
                                 self.handle_fuzzy_key(key, tx.clone());
+                                continue;
+                            }
+                            if self.active_sessions.is_some() {
+                                self.handle_active_sessions_key(key, tx.clone());
                                 continue;
                             }
                             let Some(action) = Action::from_key(key.code) else { continue; };
@@ -444,6 +463,7 @@ impl AppState {
                         Action::Lint => self.run_command(CommandKind::Lint, tx.clone()),
                         Action::JustPrompt => self.open_recipe_prompt(tx.clone()),
                         Action::Search => self.fuzzy = Some(FuzzySearch::default()),
+                        Action::ActiveSessions => self.open_active_sessions(),
                         Action::Refresh => self.request_project_scan(tx.clone()),
                         action => { let _ = self.handle_background_action(action, tx.clone()); }
                     }},
@@ -933,6 +953,85 @@ impl AppState {
         results.into_iter().map(|(_, result)| result).collect()
     }
 
+    /// Projects that currently have a tmux session, including hidden ones.
+    pub fn active_session_projects(&self) -> Vec<ActiveSessionProject> {
+        let mut projects: Vec<_> = self
+            .repositories
+            .iter()
+            .flat_map(|repository| &repository.projects)
+            .filter_map(|project| {
+                let name = Session::name_for_path(&project.path);
+                let session = self.sessions.iter().find(|session| session.name == name)?;
+                let display = project
+                    .path
+                    .strip_prefix(&self.home)
+                    .unwrap_or(&project.path)
+                    .display()
+                    .to_string();
+                Some(ActiveSessionProject {
+                    path: project.path.clone(),
+                    display,
+                    attached_clients: session.attached_clients,
+                    window_count: session.windows.len(),
+                })
+            })
+            .collect();
+        projects.sort_by(|left, right| left.display.cmp(&right.display));
+        projects
+    }
+
+    fn open_active_sessions(&mut self) {
+        let selected = self
+            .active_session_projects()
+            .iter()
+            .position(|project| project.path == self.selected)
+            .unwrap_or(0);
+        self.active_sessions = Some(ActiveSessions { selected });
+    }
+
+    fn handle_active_sessions_key(&mut self, key: KeyEvent, tx: Sender<Action>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Esc
+            || key.code == KeyCode::Char('q')
+            || (ctrl && matches!(key.code, KeyCode::Char('c' | 'g')))
+        {
+            self.active_sessions = None;
+            return;
+        }
+        let count = self.active_session_projects().len();
+        let Some(popup) = self.active_sessions.as_mut() else { return };
+        if count == 0 {
+            return;
+        }
+        popup.selected = popup.selected.min(count - 1);
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => popup.selected = popup.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => {
+                popup.selected = (popup.selected + 1).min(count - 1);
+            }
+            KeyCode::Enter => {}
+            _ => return,
+        }
+        if key.code != KeyCode::Enter {
+            return;
+        }
+        let index = self.active_sessions.as_ref().map(|popup| popup.selected).unwrap_or(0);
+        let path =
+            self.active_session_projects().into_iter().nth(index).map(|project| project.path);
+        self.active_sessions = None;
+        if let Some(path) = path {
+            let concealed = path
+                .ancestors()
+                .take_while(|ancestor| ancestor.starts_with(&self.home) && *ancestor != self.home)
+                .any(|ancestor| self.settings.display_for(ancestor) == DisplayMode::Hidden);
+            if concealed {
+                self.show_hidden = true;
+            }
+            self.select_path(path, tx);
+            self.activate_session();
+        }
+    }
+
     fn handle_fuzzy_key(&mut self, key: KeyEvent, tx: Sender<Action>) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let count = self.fuzzy_results().len();
@@ -1358,6 +1457,73 @@ mod tests {
             ],
         }];
         (home, repositories, intermediate, project)
+    }
+
+    #[tokio::test]
+    async fn active_sessions_popup_lists_running_projects_and_selects_one() {
+        let (home, repositories, intermediate, project) = tree();
+        let repository = home.join("my-repo");
+        let mut settings = Settings::default();
+        settings.directory_overrides.insert(
+            intermediate.clone(),
+            DirectoryOverride { display: Some(DisplayMode::Hidden), ..Default::default() },
+        );
+        let mut state = AppState::new(
+            home,
+            repositories,
+            SessionBackend::new("/nonexistent-canopy-test-tmux"),
+            settings,
+            None,
+        );
+        state.selected = repository.clone();
+        state.sessions = vec![
+            Session {
+                name: Session::name_for_path(&repository),
+                attached_clients: 0,
+                working_directory: repository.clone(),
+                windows: vec![],
+            },
+            Session {
+                name: Session::name_for_path(&project),
+                attached_clients: 2,
+                working_directory: project.clone(),
+                windows: vec![crate::backend::sessions::Window {
+                    index: 1,
+                    id: "@1".into(),
+                    name: "editor".into(),
+                    active: true,
+                    pane_count: 1,
+                    command: "nvim".into(),
+                    working_directory: project.clone(),
+                }],
+            },
+            Session {
+                name: "unrelated".into(),
+                attached_clients: 1,
+                working_directory: PathBuf::from("/tmp/other"),
+                windows: vec![],
+            },
+        ];
+        state.open_active_sessions();
+        assert_eq!(
+            state
+                .active_session_projects()
+                .iter()
+                .map(|project| project.display.as_str())
+                .collect::<Vec<_>>(),
+            ["my-repo", "my-repo/python_libs/my-lib"]
+        );
+        assert_eq!(state.active_sessions.as_ref().unwrap().selected, 0);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        state.handle_active_sessions_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            tx.clone(),
+        );
+        assert_eq!(state.active_sessions.as_ref().unwrap().selected, 1);
+        state.handle_active_sessions_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx);
+        assert!(state.active_sessions.is_none());
+        assert_eq!(state.selected, project);
+        assert!(state.show_hidden);
     }
 
     #[test]
