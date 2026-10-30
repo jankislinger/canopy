@@ -25,6 +25,10 @@ pub enum Action {
     Resize,
     Test,
     Lint,
+    Upgrade,
+    UpdateChecked {
+        update: Option<crate::backend::update::UpdateInfo>,
+    },
     CommandOutput {
         generation: u64,
         output: String,
@@ -90,6 +94,7 @@ impl Action {
             KeyCode::Char('n') | KeyCode::Esc => Self::Cancel,
             KeyCode::Char('t') => Self::Test,
             KeyCode::Char('l') => Self::Lint,
+            KeyCode::Char('u') => Self::Upgrade,
             _ => return None,
         })
     }
