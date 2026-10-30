@@ -252,6 +252,8 @@ pub struct AppState {
     pub sessions_refresh_pending: bool,
     pub build: BuildInfo,
     pub update: Option<UpdateInfo>,
+    /// The new version is installed but this process is still the old binary.
+    pub upgraded: bool,
 }
 impl AppState {
     /// Creates application state using the configured tree display modes.
@@ -298,6 +300,7 @@ impl AppState {
             sessions_refresh_pending: false,
             build: BuildInfo::default(),
             update: None,
+            upgraded: false,
         };
         state.expanded = state.initially_expanded_directories();
         state.selected = state
@@ -525,10 +528,19 @@ impl AppState {
     ) -> Result<(), Action> {
         match action {
             Action::Resize => {}
-            Action::UpdateChecked { update } => self.update = update,
+            Action::UpdateChecked { update } => {
+                if !self.upgraded {
+                    self.update = update;
+                }
+            }
             Action::CommandFinished { generation, title, mut output, success } => {
-                if success && title == UPGRADE_TITLE {
-                    output.push_str("\nRestart canopy to use the new version.\n");
+                if generation == self.command_generation && success && title == UPGRADE_TITLE {
+                    output.push_str(
+                        "\nThe new version is installed, but this Canopy is still the old one.\n\
+                         Close this popup (Esc), quit Canopy (q), and start it again to use it.\n",
+                    );
+                    self.update = None;
+                    self.upgraded = true;
                 }
                 if generation == self.command_generation {
                     self.command_cancellation = None;
@@ -1904,6 +1916,38 @@ mod tests {
             .unwrap();
         assert!(!state.initializing);
         assert!(state.status.contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn successful_upgrade_asks_for_restart_and_hides_the_upgrade() {
+        let mut state = AppState::new(
+            PathBuf::from("/home/test"),
+            Vec::new(),
+            SessionBackend::default(),
+            Settings::default(),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let update = || Some(UpdateInfo { latest: "abcdef1".into(), ahead_by: 1 });
+        let finished = |generation, success| Action::CommandFinished {
+            generation,
+            title: UPGRADE_TITLE.into(),
+            output: "Installed\n".into(),
+            success,
+        };
+        state
+            .handle_background_action(Action::UpdateChecked { update: update() }, tx.clone())
+            .unwrap();
+        state.command_generation = 1;
+        state.handle_background_action(finished(1, false), tx.clone()).unwrap();
+        assert!(state.update.is_some() && !state.upgraded);
+        state.handle_background_action(finished(0, true), tx.clone()).unwrap();
+        assert!(state.update.is_some() && !state.upgraded);
+        state.handle_background_action(finished(1, true), tx.clone()).unwrap();
+        assert!(state.update.is_none() && state.upgraded);
+        assert!(state.command_popup.as_ref().unwrap().output.contains("start it again"));
+        state.handle_background_action(Action::UpdateChecked { update: update() }, tx).unwrap();
+        assert!(state.update.is_none());
     }
 
     #[cfg(unix)]

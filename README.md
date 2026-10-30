@@ -34,7 +34,7 @@ Select a project with a justfile and press `:` to open the recipe picker. Typing
 
 ## Updates
 
-The startup screen shows the commit Canopy was built from, for example `Build ef12345` (with `-dirty` for builds with uncommitted changes). In the background, Canopy asks GitHub (using `curl`) whether `master` has commits this build lacks. When it does, the Commands panel shows `New version (N commits)  u: upgrade`. Pressing `u` runs `cargo install --locked --git https://github.com/jankislinger/canopy.git` in the output popup; restart Canopy afterwards. A build that already contains `master`, or is ahead of it, shows no hint.
+The startup screen shows the commit Canopy was built from, for example `Build ef12345` (with `-dirty` for builds with uncommitted changes). In the background, Canopy asks GitHub (using `curl`) whether `master` has commits this build lacks. When it does, the Commands panel shows `New version available (N commits, abc1234)  u: upgrade`. Pressing `u` runs `cargo install --locked --git https://github.com/jankislinger/canopy.git --branch master` in the output popup. After it succeeds, the panel shows `Upgraded: restart Canopy to apply`; quit and start Canopy again to use the new version. A build that already contains `master`, or is ahead of it, shows no hint.
 
 The result is cached for 8 hours in `~/.cache/canopy/update.json` and is tied to the build commit, so installing a different version always triggers a fresh check. A binary running from its cargo target directory (for example via `cargo run`) is a dev build. It keeps its cache in that directory (`target/debug/canopy-update.json`), and it only shows how many commits `master` is ahead; `u` does nothing for dev builds.
 

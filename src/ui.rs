@@ -46,12 +46,18 @@ pub(crate) fn draw_loading(f: &mut ratatui::Frame, build: &BuildInfo) {
 
 fn commands_block(s: &AppState) -> Block<'static> {
     let block = Block::bordered().title("Commands");
+    if s.upgraded {
+        let hint = " Upgraded: restart Canopy to apply ";
+        return block
+            .title(Line::from(hint).right_aligned().style(Style::default().fg(Color::Green)));
+    }
     let Some(update) = &s.update else { return block };
     let commits = if update.ahead_by == 1 { "commit" } else { "commits" };
     let hint = if s.build.dev {
         format!(" {} is {} {commits} ahead ", crate::backend::update::BRANCH, update.ahead_by)
     } else {
-        format!(" New version ({} {commits})  u: upgrade ", update.ahead_by)
+        let short = update.latest.get(..7).unwrap_or(&update.latest);
+        format!(" New version available ({} {commits}, {short})  u: upgrade ", update.ahead_by)
     };
     block.title(Line::from(hint).right_aligned().style(Style::default().fg(Color::Yellow)))
 }
@@ -636,6 +642,7 @@ mod tests {
             sessions_refresh_pending: false,
             build: Default::default(),
             update: None,
+            upgraded: false,
         }
     }
 
@@ -650,11 +657,18 @@ mod tests {
         };
         let text = render(&mut state);
         assert!(!text.contains("u: upgrade") && !text.contains("ahead"));
-        state.update = Some(UpdateInfo { latest: "abcdef1".into(), ahead_by: 3 });
-        assert!(render(&mut state).contains("New version (3 commits)  u: upgrade"));
+        state.update = Some(UpdateInfo { latest: "abcdef123456".into(), ahead_by: 3 });
+        assert!(
+            render(&mut state).contains("New version available (3 commits, abcdef1)  u: upgrade")
+        );
         state.build.dev = true;
         let text = render(&mut state);
         assert!(text.contains(&format!("{} is 3 commits ahead", crate::backend::update::BRANCH)));
+        assert!(!text.contains("u: upgrade"));
+        state.build.dev = false;
+        state.upgraded = true;
+        let text = render(&mut state);
+        assert!(text.contains("Upgraded: restart Canopy to apply"));
         assert!(!text.contains("u: upgrade"));
     }
 
