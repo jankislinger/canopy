@@ -12,8 +12,13 @@ lint:
 test:
     cargo test --all-targets
 
-# Build all targets, then run lint checks and tests
+# Run file hygiene checks on all files
+pre-commit:
+    uvx pre-commit run --all-files --show-diff-on-failure --color=always
+
+# Build all targets, then run file hygiene checks, lint checks, and tests
 check:
     cargo build --all-targets
+    @just pre-commit
     @just lint
     @just test
