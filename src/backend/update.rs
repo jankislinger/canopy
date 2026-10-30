@@ -8,7 +8,7 @@ use std::{
 };
 
 pub const REPOSITORY_URL: &str = "https://github.com/jankislinger/canopy.git";
-pub const BRANCH: &str = "master";
+pub const BRANCH: &str = "auto-upgrade";
 const API_URL: &str = "https://api.github.com/repos/jankislinger/canopy";
 const CACHE_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
 
