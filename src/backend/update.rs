@@ -8,6 +8,7 @@ use std::{
 };
 
 pub const REPOSITORY_URL: &str = "https://github.com/jankislinger/canopy.git";
+pub const BRANCH: &str = "master";
 const API_URL: &str = "https://api.github.com/repos/jankislinger/canopy";
 const CACHE_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
 
@@ -120,7 +121,8 @@ pub fn check(home: &Path, build: &BuildInfo) -> Option<UpdateInfo> {
 
 /// Fetches the master sha and how many of its commits `build` lacks.
 fn fetch(build: &str) -> Option<(String, u64)> {
-    let (status, latest) = get(&format!("{API_URL}/commits/master"), "application/vnd.github.sha")?;
+    let (status, latest) =
+        get(&format!("{API_URL}/commits/{BRANCH}"), "application/vnd.github.sha")?;
     let latest = latest.trim().to_owned();
     if status != 200 || latest.is_empty() {
         return None;

@@ -49,7 +49,7 @@ fn commands_block(s: &AppState) -> Block<'static> {
     let Some(update) = &s.update else { return block };
     let commits = if update.ahead_by == 1 { "commit" } else { "commits" };
     let hint = if s.build.dev {
-        format!(" master is {} {commits} ahead ", update.ahead_by)
+        format!(" {} is {} {commits} ahead ", crate::backend::update::BRANCH, update.ahead_by)
     } else {
         format!(" New version ({} {commits})  u: upgrade ", update.ahead_by)
     };
@@ -654,7 +654,7 @@ mod tests {
         assert!(render(&mut state).contains("New version (3 commits)  u: upgrade"));
         state.build.dev = true;
         let text = render(&mut state);
-        assert!(text.contains("master is 3 commits ahead"));
+        assert!(text.contains(&format!("{} is 3 commits ahead", crate::backend::update::BRANCH)));
         assert!(!text.contains("u: upgrade"));
     }
 

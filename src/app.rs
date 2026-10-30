@@ -1240,8 +1240,8 @@ impl AppState {
         if self.update.is_none() || self.build.dev {
             return;
         }
-        let command =
-            ["cargo", "install", "--locked", "--git", crate::backend::update::REPOSITORY_URL];
+        use crate::backend::update::{BRANCH, REPOSITORY_URL};
+        let command = ["cargo", "install", "--locked", "--git", REPOSITORY_URL, "--branch", BRANCH];
         let commands = vec![command.iter().map(|arg| (*arg).to_owned()).collect()];
         self.run_commands(self.home.clone(), UPGRADE_TITLE.into(), commands, tx);
     }
