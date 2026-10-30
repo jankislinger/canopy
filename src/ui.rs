@@ -1,6 +1,6 @@
 use crate::{
     app::{AppState, Confirmation},
-    backend::{ProjectKind, sessions::Session},
+    backend::{ProjectKind, sessions::Session, update::BuildInfo},
 };
 use ansi_to_tui::IntoText;
 use ratatui::{
@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, Paragraph},
 };
 /// Shows a centered wordmark while the initial project list loads.
-pub(crate) fn draw_loading(f: &mut ratatui::Frame) {
+pub(crate) fn draw_loading(f: &mut ratatui::Frame, build: &BuildInfo) {
     let logo = [
         " ██████╗ █████╗ ███╗   ██╗ ██████╗ ██████╗ ██╗   ██╗",
         "██╔════╝██╔══██╗████╗  ██║██╔═══██╗██╔══██╗╚██╗ ██╔╝",
@@ -28,6 +28,7 @@ pub(crate) fn draw_loading(f: &mut ratatui::Frame) {
     lines.push(Line::from(""));
     lines.push(Line::from("Loading projects…"));
     lines.push(Line::from("q: quit"));
+    lines.push(Line::from(build.label()).style(Style::default().fg(Color::DarkGray)));
     let height = lines.len() as u16;
     let rect = ratatui::layout::Rect::new(
         area.x,
@@ -43,10 +44,28 @@ pub(crate) fn draw_loading(f: &mut ratatui::Frame) {
     );
 }
 
+fn commands_block(s: &AppState) -> Block<'static> {
+    let block = Block::bordered().title("Commands");
+    if s.upgraded {
+        let hint = " Upgraded: restart Canopy to apply ";
+        return block
+            .title(Line::from(hint).right_aligned().style(Style::default().fg(Color::Green)));
+    }
+    let Some(update) = &s.update else { return block };
+    let commits = if update.ahead_by == 1 { "commit" } else { "commits" };
+    let hint = if s.build.dev {
+        format!(" {} is {} {commits} ahead ", crate::backend::update::BRANCH, update.ahead_by)
+    } else {
+        let short = update.latest.get(..7).unwrap_or(&update.latest);
+        format!(" New version available ({} {commits}, {short})  u: upgrade ", update.ahead_by)
+    };
+    block.title(Line::from(hint).right_aligned().style(Style::default().fg(Color::Yellow)))
+}
+
 /// Renders the project tree, details pane, and command hints.
 pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
     if s.initializing {
-        draw_loading(f);
+        draw_loading(f, &s.build);
         return;
     }
     let a = Layout::vertical([Constraint::Min(8), Constraint::Length(5)]).split(f.area());
@@ -158,7 +177,7 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
             Line::from("/: find  a: sessions  Esc: close popup  q: quit"),
             Line::from(if s.confirmation.is_some() { "Confirm stop: y/n" } else { &s.status }),
         ])
-        .block(Block::bordered().title("Commands")),
+        .block(commands_block(s)),
         a[1],
     );
     if let Some(Confirmation::StopSession { path, .. }) = &s.confirmation {
@@ -621,7 +640,36 @@ mod tests {
             git_status_generation: 0,
             sessions_refresh_generation: 0,
             sessions_refresh_pending: false,
+            build: Default::default(),
+            update: None,
+            upgraded: false,
         }
+    }
+
+    #[test]
+    fn commands_panel_suggests_upgrade_only_when_master_is_ahead() {
+        use crate::backend::update::UpdateInfo;
+        let mut state = test_state();
+        let render = |state: &mut AppState| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, state)).unwrap();
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>()
+        };
+        let text = render(&mut state);
+        assert!(!text.contains("u: upgrade") && !text.contains("ahead"));
+        state.update = Some(UpdateInfo { latest: "abcdef123456".into(), ahead_by: 3 });
+        assert!(
+            render(&mut state).contains("New version available (3 commits, abcdef1)  u: upgrade")
+        );
+        state.build.dev = true;
+        let text = render(&mut state);
+        assert!(text.contains(&format!("{} is 3 commits ahead", crate::backend::update::BRANCH)));
+        assert!(!text.contains("u: upgrade"));
+        state.build.dev = false;
+        state.upgraded = true;
+        let text = render(&mut state);
+        assert!(text.contains("Upgraded: restart Canopy to apply"));
+        assert!(!text.contains("u: upgrade"));
     }
 
     #[test]
@@ -790,6 +838,7 @@ mod tests {
             assert!(!text.contains("outside tmux"));
             if width > 1 {
                 assert!(text.contains("Loading projects…"));
+                assert!(height < 10 || text.contains("Build unknown"));
                 if width < 54 {
                     assert!(text.contains("canopy"));
                 } else {

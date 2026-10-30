@@ -5,6 +5,7 @@ use crate::{
     backend::{
         commands::CommandKind,
         sessions::{Session, SessionBackend},
+        update::{BuildInfo, UpdateInfo},
     },
     config::{DisplayMode, Settings},
     ui,
@@ -20,6 +21,8 @@ use tokio::{
     sync::mpsc::{Receiver, Sender},
     time::{self, Duration},
 };
+const UPGRADE_TITLE: &str = "Upgrade";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirmation {
     StopSession { name: String, path: PathBuf },
@@ -247,6 +250,10 @@ pub struct AppState {
     pub git_status_generation: u64,
     pub sessions_refresh_generation: u64,
     pub sessions_refresh_pending: bool,
+    pub build: BuildInfo,
+    pub update: Option<UpdateInfo>,
+    /// The new version is installed but this process is still the old binary.
+    pub upgraded: bool,
 }
 impl AppState {
     /// Creates application state using the configured tree display modes.
@@ -291,6 +298,9 @@ impl AppState {
             git_status_generation: 0,
             sessions_refresh_generation: 0,
             sessions_refresh_pending: false,
+            build: BuildInfo::default(),
+            update: None,
+            upgraded: false,
         };
         state.expanded = state.initially_expanded_directories();
         state.selected = state
@@ -323,6 +333,19 @@ impl AppState {
         } else {
             self.request_selected_details(tx.clone());
         }
+        if !self.build.sha.is_empty() {
+            let home = self.home.clone();
+            let build = self.build.clone();
+            let update_tx = tx.clone();
+            tokio::spawn(async move {
+                let update = tokio::task::spawn_blocking(move || {
+                    crate::backend::update::check(&home, &build)
+                })
+                .await
+                .unwrap_or_default();
+                let _ = update_tx.send(Action::UpdateChecked { update }).await;
+            });
+        }
         let mut tick = time::interval(Duration::from_millis(150));
         let mut sessions_tick = time::interval(Duration::from_secs(1));
         sessions_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -336,7 +359,7 @@ impl AppState {
         loop {
             terminal.draw(|f| {
                 if startup_logo_visible {
-                    ui::draw_loading(f);
+                    ui::draw_loading(f, &self.build);
                 } else {
                     ui::draw(f, &mut self);
                 }
@@ -461,6 +484,7 @@ impl AppState {
                         }
                         Action::Test => self.run_command(CommandKind::Test, tx.clone()),
                         Action::Lint => self.run_command(CommandKind::Lint, tx.clone()),
+                        Action::Upgrade => self.upgrade(tx.clone()),
                         Action::JustPrompt => self.open_recipe_prompt(tx.clone()),
                         Action::Search => self.fuzzy = Some(FuzzySearch::default()),
                         Action::ActiveSessions => self.open_active_sessions(),
@@ -504,7 +528,20 @@ impl AppState {
     ) -> Result<(), Action> {
         match action {
             Action::Resize => {}
-            Action::CommandFinished { generation, title, output, success } => {
+            Action::UpdateChecked { update } => {
+                if !self.upgraded {
+                    self.update = update;
+                }
+            }
+            Action::CommandFinished { generation, title, mut output, success } => {
+                if generation == self.command_generation && success && title == UPGRADE_TITLE {
+                    output.push_str(
+                        "\nThe new version is installed, but this Canopy is still the old one.\n\
+                         Close this popup (Esc), quit Canopy (q), and start it again to use it.\n",
+                    );
+                    self.update = None;
+                    self.upgraded = true;
+                }
                 if generation == self.command_generation {
                     self.command_cancellation = None;
                     if let Some(popup) = self.command_popup.as_mut() {
@@ -779,6 +816,7 @@ impl AppState {
                 | Action::JustRecipesLoaded { .. }
                 | Action::ProjectsCached { .. }
                 | Action::ProjectsLoaded { .. }
+                | Action::UpdateChecked { .. }
                 | Action::CommandOutput { .. }
                 | Action::CommandFinished { .. } => {}
                 _ => {
@@ -1206,6 +1244,18 @@ impl AppState {
             .map(|command| command.iter().map(|arg| (*arg).to_owned()).collect())
             .collect();
         self.run_commands(project.path, title, commands, tx);
+    }
+
+    /// Reinstalls the latest master. Dev builds only show the hint, since installing would
+    /// replace the central binary.
+    fn upgrade(&mut self, tx: Sender<Action>) {
+        if self.update.is_none() || self.build.dev {
+            return;
+        }
+        use crate::backend::update::{BRANCH, REPOSITORY_URL};
+        let command = ["cargo", "install", "--locked", "--git", REPOSITORY_URL, "--branch", BRANCH];
+        let commands = vec![command.iter().map(|arg| (*arg).to_owned()).collect()];
+        self.run_commands(self.home.clone(), UPGRADE_TITLE.into(), commands, tx);
     }
 
     fn run_commands(
@@ -1866,6 +1916,38 @@ mod tests {
             .unwrap();
         assert!(!state.initializing);
         assert!(state.status.contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn successful_upgrade_asks_for_restart_and_hides_the_upgrade() {
+        let mut state = AppState::new(
+            PathBuf::from("/home/test"),
+            Vec::new(),
+            SessionBackend::default(),
+            Settings::default(),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let update = || Some(UpdateInfo { latest: "abcdef1".into(), ahead_by: 1 });
+        let finished = |generation, success| Action::CommandFinished {
+            generation,
+            title: UPGRADE_TITLE.into(),
+            output: "Installed\n".into(),
+            success,
+        };
+        state
+            .handle_background_action(Action::UpdateChecked { update: update() }, tx.clone())
+            .unwrap();
+        state.command_generation = 1;
+        state.handle_background_action(finished(1, false), tx.clone()).unwrap();
+        assert!(state.update.is_some() && !state.upgraded);
+        state.handle_background_action(finished(0, true), tx.clone()).unwrap();
+        assert!(state.update.is_some() && !state.upgraded);
+        state.handle_background_action(finished(1, true), tx.clone()).unwrap();
+        assert!(state.update.is_none() && state.upgraded);
+        assert!(state.command_popup.as_ref().unwrap().output.contains("start it again"));
+        state.handle_background_action(Action::UpdateChecked { update: update() }, tx).unwrap();
+        assert!(state.update.is_none());
     }
 
     #[cfg(unix)]

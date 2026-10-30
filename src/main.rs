@@ -33,6 +33,7 @@ async fn main() -> color_eyre::Result<()> {
         settings,
         settings_error,
     );
+    state.build = backend::update::BuildInfo::current();
     state.initializing = true;
     state.tmux_warning = std::env::var_os("TMUX").is_none();
     let result = state.run(&mut terminal, &mut rx, tx).await;
