@@ -36,6 +36,11 @@ async fn main() -> color_eyre::Result<()> {
     state.build = backend::update::BuildInfo::current();
     state.initializing = true;
     state.tmux_warning = std::env::var_os("TMUX").is_none();
+    if !state.tmux_warning
+        && let Err(error) = state.session_backend.prepare_host_session()
+    {
+        state.status = error.to_string();
+    }
     let result = state.run(&mut terminal, &mut rx, tx).await;
     ratatui::try_restore()?;
     shutdown.store(true, Ordering::Relaxed);
