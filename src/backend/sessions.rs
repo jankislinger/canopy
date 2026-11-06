@@ -174,6 +174,20 @@ impl SessionBackend {
             .map(|_| ())
     }
 
+    /// Names the current window `canopy` and, when the only session is the
+    /// default unnamed `0`, renames that session to `main`.
+    pub fn prepare_host_session(&self) -> Result<(), SessionError> {
+        if std::env::var_os("TMUX").is_none() {
+            return Err(SessionError::OutsideTmux);
+        }
+        self.command(["rename-window", "canopy"])?;
+        let sessions = self.list()?;
+        if sessions.len() == 1 && sessions[0].name == "0" {
+            self.command(["rename-session", "-t", "=0", "main"])?;
+        }
+        Ok(())
+    }
+
     fn command<'a, I>(&self, args: I) -> Result<String, SessionError>
     where
         I: IntoIterator<Item = &'a str>,
@@ -420,5 +434,102 @@ mod tests {
         assert_eq!(sessions[1].windows[0].name, "terminal");
         assert_eq!(sessions[1].windows[0].index, 0);
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn prepare_host_session_with_listing(listing: &str, tmux: Option<&str>) -> String {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        const EXECUTABLE_ENV: &str = "CANOPY_TEST_PREPARE_HOST_EXECUTABLE";
+        const LISTING_ENV: &str = "CANOPY_TEST_PREPARE_HOST_LISTING";
+        const LOG_ENV: &str = "CANOPY_TEST_PREPARE_HOST_LOG";
+        if let Some(executable) = std::env::var_os(EXECUTABLE_ENV) {
+            let result = SessionBackend::new(executable).prepare_host_session();
+            if std::env::var_os("CANOPY_TEST_PREPARE_HOST_EXPECT_OUTSIDE").is_some() {
+                assert!(matches!(result, Err(SessionError::OutsideTmux)));
+            } else {
+                result.unwrap();
+            }
+            std::process::exit(0);
+        }
+        let temp = std::env::temp_dir().join(format!(
+            "canopy-prepare-host-test-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let executable = temp.join("tmux");
+        let log = temp.join("commands.log");
+        fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' \"$*\" >> \"$CANOPY_TEST_PREPARE_HOST_LOG\"\n",
+                "case \"$1\" in\n",
+                "rename-window) [ \"$2\" = canopy ] || exit 1 ;;\n",
+                "list-sessions) printf '%s' \"$CANOPY_TEST_PREPARE_HOST_LISTING\" ;;\n",
+                "list-windows) : ;;\n",
+                "rename-session) [ \"$2\" = -t ] && [ \"$3\" = '=0' ] && [ \"$4\" = main ] || exit 1 ;;\n",
+                "*) exit 1 ;;\nesac\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", std::thread::current().name().unwrap()])
+            .env(EXECUTABLE_ENV, &executable)
+            .env(LISTING_ENV, listing)
+            .env(LOG_ENV, &log)
+            .env_remove("CANOPY_TEST_PREPARE_HOST_EXPECT_OUTSIDE");
+        match tmux {
+            Some(value) => {
+                command.env("TMUX", value);
+            }
+            None => {
+                command.env_remove("TMUX").env("CANOPY_TEST_PREPARE_HOST_EXPECT_OUTSIDE", "1");
+            }
+        }
+        let output = command.output().unwrap();
+        let recorded = fs::read_to_string(&log).unwrap_or_default();
+        fs::remove_dir_all(temp).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        recorded
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_host_session_renames_window_and_default_session() {
+        let recorded = prepare_host_session_with_listing("0\t1\t/tmp\n", Some("/tmp/tmux,1,0"));
+        assert!(recorded.lines().any(|line| line == "rename-window canopy"));
+        assert!(recorded.lines().any(|line| line == "rename-session -t =0 main"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_host_session_skips_session_rename_when_not_only_default() {
+        let named = prepare_host_session_with_listing("main\t1\t/tmp\n", Some("/tmp/tmux,1,0"));
+        assert!(named.lines().any(|line| line == "rename-window canopy"));
+        assert!(!named.contains("rename-session"));
+        let extra = prepare_host_session_with_listing(
+            "0\t1\t/tmp\nproject\t0\t/tmp/p\n",
+            Some("/tmp/tmux,1,0"),
+        );
+        assert!(extra.lines().any(|line| line == "rename-window canopy"));
+        assert!(!extra.contains("rename-session"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_host_session_requires_tmux() {
+        let recorded = prepare_host_session_with_listing("0\t1\t/tmp\n", None);
+        assert!(recorded.is_empty());
     }
 }
