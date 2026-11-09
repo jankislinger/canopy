@@ -42,7 +42,7 @@ impl Project {
     pub fn try_from_path(path: impl Into<PathBuf>) -> Option<Self> {
         let path = path.into();
         let mut kinds = Vec::new();
-        if path.join(".git").is_dir() {
+        if super::git::is_git_checkout(&path) {
             kinds.push(ProjectKind::Git);
         }
         if path.join("pyproject.toml").is_file() {
@@ -129,7 +129,7 @@ impl Repository {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name == ".git" && path.is_dir() {
+                if name == ".git" && super::git::is_git_checkout(&directory) {
                     is_repo = true;
                     continue;
                 }
@@ -266,6 +266,27 @@ mod tests {
 
         let filtered = Repository::discover(&t.0, &["python".into()]).unwrap();
         assert_eq!(filtered[0].projects.len(), 1);
+    }
+
+    #[test]
+    fn discovers_linked_worktrees() {
+        let t = Temp::new();
+        let main = t.0.join("main");
+        fs::create_dir_all(main.join(".git")).unwrap();
+        let worktree = t.0.join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: /tmp/main.git/worktrees/worktree\n").unwrap();
+        let ignored = t.0.join("not-a-repo");
+        fs::create_dir_all(&ignored).unwrap();
+        fs::write(ignored.join(".git"), "not a gitdir\n").unwrap();
+        let skipped_dirs =
+            DEFAULT_SKIPPED_DIRS.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        let repos = Repository::discover(&t.0, &skipped_dirs).unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].path, main);
+        assert_eq!(repos[0].projects[0].kinds, vec![ProjectKind::Git]);
+        assert_eq!(repos[1].path, worktree);
+        assert_eq!(repos[1].projects[0].kinds, vec![ProjectKind::Git]);
     }
 }
 
