@@ -1,7 +1,23 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
+
+/// Reports whether `path` is a Git checkout: a `.git` directory, or a linked
+/// worktree whose `.git` file points at a gitdir.
+pub fn is_git_checkout(path: &Path) -> bool {
+    is_git_marker(&path.join(".git"))
+}
+
+fn is_git_marker(git: &Path) -> bool {
+    if git.is_dir() {
+        return true;
+    }
+    git.is_file()
+        && fs::read_to_string(git)
+            .is_ok_and(|contents| contents.trim_start().starts_with("gitdir:"))
+}
 
 /// Git information displayed for a selected project.
 #[derive(Clone, Debug, PartialEq, Eq)]

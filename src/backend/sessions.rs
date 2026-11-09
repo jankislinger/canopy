@@ -229,7 +229,7 @@ impl Session {
         let project_name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
         let mut current = Some(path);
         while let Some(directory) = current {
-            if directory.join(".git").is_dir() {
+            if super::git::is_git_checkout(directory) {
                 let repository_name =
                     directory.file_name().unwrap_or(directory.as_os_str()).to_string_lossy();
                 return if directory == path {
@@ -308,6 +308,13 @@ mod tests {
         assert_eq!(Session::name_for_path(&root), "my-monorepo");
         assert_eq!(Session::name_for_path(&project), "my-monorepo/my-utils");
         let _ = std::fs::remove_dir_all(root);
+
+        let worktree = std::env::temp_dir().join("my-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: /tmp/repo.git/worktrees/my-worktree\n")
+            .unwrap();
+        assert_eq!(Session::name_for_path(&worktree), "my-worktree");
+        let _ = std::fs::remove_dir_all(worktree);
     }
     #[test]
     fn parses_session_listing() {
