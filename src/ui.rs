@@ -589,6 +589,7 @@ mod tests {
         AppState {
             repositories: Vec::new(),
             home: PathBuf::from("/home/test"),
+            user_home: PathBuf::from("/home/test"),
             selected: PathBuf::from("/home/test/repo"),
             project_list_state: Default::default(),
             expanded: HashSet::new(),

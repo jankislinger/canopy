@@ -59,23 +59,24 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Loads user settings, returning defaults and a displayable error on invalid input.
+    /// Loads `~/.config/canopy/settings.json`, returning defaults when the file is missing.
     pub fn load(home: &Path) -> (Self, Option<String>) {
         let path = home.join(".config/canopy/settings.json");
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return (Self::default(), None);
-            }
-            Err(error) => {
-                return (Self::default(), Some(format!("{}: {error}", path.display())));
-            }
-        };
-
-        match Self::parse(&contents, home) {
-            Ok(settings) => (settings, None),
-            Err(error) => (Self::default(), Some(error)),
+        match fs::read_to_string(&path) {
+            Ok(contents) => match Self::parse(&contents, home) {
+                Ok(settings) => (settings, None),
+                Err(error) => (Self::default(), Some(error)),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
+            Err(error) => (Self::default(), Some(format!("{}: {error}", path.display()))),
         }
+    }
+
+    /// Loads an explicit settings file. `home` still resolves `~` inside directory overrides.
+    pub fn load_path(path: &Path, home: &Path) -> Result<Self, String> {
+        let contents =
+            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        Self::parse(&contents, home)
     }
 
     fn parse(contents: &str, home: &Path) -> Result<Self, String> {
@@ -203,6 +204,15 @@ mod tests {
         let (settings, error) = Settings::load(&home.0);
         assert_eq!(settings, Settings::default());
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn explicit_config_file_must_exist() {
+        let home = TempHome::new();
+        let path = home.0.join("missing.json");
+        let error = Settings::load_path(&path, &home.0).unwrap_err();
+        assert!(error.contains("missing.json"));
+        assert!(error.contains("No such file"));
     }
 
     #[test]

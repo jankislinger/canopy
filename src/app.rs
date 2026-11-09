@@ -219,6 +219,8 @@ impl CommandPopup {
 pub struct AppState {
     pub repositories: Vec<Repository>,
     pub home: PathBuf,
+    /// User home, used for the project cache and update check. Equals `home` unless a path was given.
+    pub user_home: PathBuf,
     pub selected: PathBuf,
     pub project_list_state: ListState,
     pub expanded: HashSet<PathBuf>,
@@ -267,7 +269,8 @@ impl AppState {
         let mut state = Self {
             selected: home.clone(),
             repositories,
-            home,
+            home: home.clone(),
+            user_home: home,
             project_list_state: ListState::default(),
             expanded: HashSet::new(),
             show_hidden: false,
@@ -319,12 +322,13 @@ impl AppState {
     ) -> color_eyre::Result<()> {
         self.request_sessions_refresh(tx.clone());
         if self.initializing {
-            let home = self.home.clone();
+            let root = self.home.clone();
+            let user_home = self.user_home.clone();
             let skipped_dirs = self.settings.skipped_dirs.clone();
             let cache_tx = tx.clone();
             tokio::spawn(async move {
                 let repositories = tokio::task::spawn_blocking(move || {
-                    crate::backend::cache::load(&home, &skipped_dirs)
+                    crate::backend::cache::load(&user_home, &root, &skipped_dirs)
                 })
                 .await
                 .unwrap_or_default();
@@ -334,12 +338,12 @@ impl AppState {
             self.request_selected_details(tx.clone());
         }
         if !self.build.sha.is_empty() {
-            let home = self.home.clone();
+            let user_home = self.user_home.clone();
             let build = self.build.clone();
             let update_tx = tx.clone();
             tokio::spawn(async move {
                 let update = tokio::task::spawn_blocking(move || {
-                    crate::backend::update::check(&home, &build)
+                    crate::backend::update::check(&user_home, &build)
                 })
                 .await
                 .unwrap_or_default();
@@ -683,12 +687,14 @@ impl AppState {
         self.project_scan_pending = true;
         self.project_scan_generation += 1;
         let generation = self.project_scan_generation;
-        let home = self.home.clone();
+        let root = self.home.clone();
+        let user_home = self.user_home.clone();
         let skipped_dirs = self.settings.skipped_dirs.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let repositories = Repository::discover(&home, &skipped_dirs)?;
-                let _ = crate::backend::cache::save(&home, &skipped_dirs, &repositories);
+                let repositories = Repository::discover(&root, &skipped_dirs)?;
+                let _ =
+                    crate::backend::cache::save(&user_home, &root, &skipped_dirs, &repositories);
                 Ok::<_, color_eyre::Report>(repositories)
             })
             .await
