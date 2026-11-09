@@ -11,14 +11,14 @@ struct Snapshot {
     repositories: Vec<Repository>,
 }
 
-pub fn load(home: &Path, skipped_dirs: &[String]) -> Option<Vec<Repository>> {
-    let bytes = fs::read(home.join(".cache/canopy/projects.json")).ok()?;
+pub fn load(user_home: &Path, root: &Path, skipped_dirs: &[String]) -> Option<Vec<Repository>> {
+    let bytes = fs::read(user_home.join(".cache/canopy/projects.json")).ok()?;
     let snapshot: Snapshot = serde_json::from_slice(&bytes).ok()?;
-    if snapshot.version != 1 || snapshot.home != home || snapshot.skipped_dirs != skipped_dirs {
+    if snapshot.version != 1 || snapshot.home != root || snapshot.skipped_dirs != skipped_dirs {
         return None;
     }
     if snapshot.repositories.iter().any(|repo| {
-        !repo.path.starts_with(home)
+        !repo.path.starts_with(root)
             || repo.projects.is_empty()
             || repo
                 .projects
@@ -30,12 +30,17 @@ pub fn load(home: &Path, skipped_dirs: &[String]) -> Option<Vec<Repository>> {
     Some(snapshot.repositories)
 }
 
-pub fn save(home: &Path, skipped_dirs: &[String], repositories: &[Repository]) -> io::Result<()> {
-    let directory = home.join(".cache/canopy");
+pub fn save(
+    user_home: &Path,
+    root: &Path,
+    skipped_dirs: &[String],
+    repositories: &[Repository],
+) -> io::Result<()> {
+    let directory = user_home.join(".cache/canopy");
     fs::create_dir_all(&directory)?;
     let snapshot = Snapshot {
         version: 1,
-        home: home.to_owned(),
+        home: root.to_owned(),
         skipped_dirs: skipped_dirs.to_vec(),
         repositories: repositories.to_vec(),
     };
@@ -58,7 +63,7 @@ mod tests {
     fn cache_roundtrip_and_invalid_snapshots() {
         let home = std::env::temp_dir().join(format!("canopy-cache-{}", std::process::id()));
         let skipped = vec!["target".to_owned()];
-        assert!(load(&home, &skipped).is_none());
+        assert!(load(&home, &home, &skipped).is_none());
         let path = home.join("repo");
         let repositories = vec![Repository {
             path: path.clone(),
@@ -68,15 +73,15 @@ mod tests {
                 Some(vec!["test".into()]),
             )],
         }];
-        save(&home, &skipped, &repositories).unwrap();
-        let cached = load(&home, &skipped).unwrap();
+        save(&home, &home, &skipped, &repositories).unwrap();
+        let cached = load(&home, &home, &skipped).unwrap();
         assert_eq!(cached[0].projects[0].path, path);
         assert_eq!(cached[0].projects[0].commands(CommandKind::Test), vec![vec!["just", "test"]]);
-        assert!(load(&home, &[]).is_none());
-        save(&home, &skipped, &[]).unwrap();
-        assert!(load(&home, &skipped).unwrap().is_empty());
+        assert!(load(&home, &home, &[]).is_none());
+        save(&home, &home, &skipped, &[]).unwrap();
+        assert!(load(&home, &home, &skipped).unwrap().is_empty());
         fs::write(home.join(".cache/canopy/projects.json"), "{broken").unwrap();
-        assert!(load(&home, &skipped).is_none());
+        assert!(load(&home, &home, &skipped).is_none());
         fs::remove_dir_all(home).unwrap();
     }
 }
