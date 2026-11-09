@@ -81,23 +81,44 @@ pub fn recipe_command(justfile: &Path, input: &str) -> Result<Vec<String>, Strin
     Ok(command)
 }
 
+/// Runs `just --list`. Retries when the kernel reports the executable is busy, which happens
+/// on overlay filesystems after a script is written and executed immediately.
+fn run_just(
+    executable: &OsStr,
+    path: &Path,
+    justfile: &Path,
+) -> Result<std::process::Output, String> {
+    let mut delay = std::time::Duration::from_millis(20);
+    for _ in 0..5 {
+        match Command::new(executable)
+            .current_dir(path)
+            .args([
+                "--list",
+                "--color",
+                "never",
+                "--list-heading",
+                "",
+                "--list-prefix",
+                "  ",
+                "--justfile",
+            ])
+            .arg(justfile)
+            .output()
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(error) => return Err(format!("could not run just: {error}")),
+            Ok(output) => return Ok(output),
+        }
+    }
+    Err("could not run just: Text file busy (os error 26)".into())
+}
+
 fn list_recipes_with(path: &Path, executable: &OsStr) -> Result<Option<String>, String> {
     let Some(justfile) = justfile(path) else { return Ok(None) };
-    let output = Command::new(executable)
-        .current_dir(path)
-        .args([
-            "--list",
-            "--color",
-            "never",
-            "--list-heading",
-            "",
-            "--list-prefix",
-            "  ",
-            "--justfile",
-        ])
-        .arg(justfile)
-        .output()
-        .map_err(|error| format!("could not run just: {error}"))?;
+    let output = run_just(executable, path, &justfile)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
