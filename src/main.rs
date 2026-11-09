@@ -52,11 +52,13 @@ async fn main() -> color_eyre::Result<()> {
     let (settings, settings_error) = match invocation.config_file {
         Some(raw) => {
             let path = cli::expand_home(&raw, &user_home);
-            (
-                config::Settings::load_path(&path, &user_home)
-                    .map_err(|error| color_eyre::eyre::eyre!("{error}"))?,
-                None,
-            )
+            match config::Settings::load_path(&path, &user_home) {
+                Ok(settings) => (settings, None),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
         }
         None => config::Settings::load(&user_home),
     };
