@@ -4,7 +4,7 @@ use crate::{
     backend::{Project, ProjectKind, Repository, git::GitStatus},
     backend::{
         commands::CommandKind,
-        sessions::{Session, SessionBackend},
+        sessions::{CreatedSession, Session, SessionBackend},
         update::{BuildInfo, UpdateInfo},
     },
     config::{DisplayMode, Settings},
@@ -233,6 +233,9 @@ pub struct AppState {
     pub spinner: usize,
     pub status: String,
     pub sessions: Vec<Session>,
+    /// Projects whose windows are still opening. The value is whether Enter should
+    /// switch once every window has been opened or has failed.
+    pub starting: HashMap<PathBuf, bool>,
     pub open_window_pending: bool,
     pub session_backend: SessionBackend,
     pub confirmation: Option<Confirmation>,
@@ -282,6 +285,7 @@ impl AppState {
             spinner: 0,
             status: String::new(),
             sessions: Vec::new(),
+            starting: HashMap::new(),
             open_window_pending: false,
             session_backend,
             confirmation: None,
@@ -478,8 +482,8 @@ impl AppState {
                             if self.selected_has_children() { self.expanded.insert(self.selected.clone()); }
                         }
                         Action::ToggleHidden => self.toggle_hidden(tx.clone()),
-                        Action::Open => self.activate_session(),
-                        Action::Start => self.start_session(),
+                        Action::Open => self.begin_session(tx.clone(), true),
+                        Action::Start => self.begin_session(tx.clone(), false),
                         Action::Stop => self.request_stop_session(),
                         Action::Confirm => {},
                         Action::Cancel => {
@@ -594,6 +598,9 @@ impl AppState {
                         self.sessions = sessions;
                     }
                 }
+            }
+            Action::SessionStartFinished { path, result } => {
+                self.finish_session_start(path, result)
             }
             Action::JustRecipesLoaded { generation, path, result } => {
                 if let Some(prompt) = self.recipe_prompt.as_mut()
@@ -824,7 +831,8 @@ impl AppState {
                 | Action::ProjectsLoaded { .. }
                 | Action::UpdateChecked { .. }
                 | Action::CommandOutput { .. }
-                | Action::CommandFinished { .. } => {}
+                | Action::CommandFinished { .. }
+                | Action::SessionStartFinished { .. } => {}
                 _ => {
                     self.open_window_pending = false;
                     self.status.clear();
@@ -833,7 +841,9 @@ impl AppState {
         }
         match action {
             Action::OpenWindowPrefix => {
-                if self.selected_session().is_some() {
+                if self.starting.contains_key(&self.selected) {
+                    self.status = "Session is still starting".into();
+                } else if self.selected_session().is_some() {
                     self.open_window_pending = true;
                     self.status = "Open window: press tmux index 0–9 (Esc cancels)".into();
                 } else {
@@ -862,37 +872,82 @@ impl AppState {
         self.refresh_sessions();
     }
 
-    fn start_session(&mut self) {
-        if let Some(name) = self.selected_session_name() {
-            let editor = self.settings.editor_for(&self.selected);
-            let agent = self.settings.agent_for(&self.selected);
-            match self.session_backend.create(&self.selected, editor, agent) {
-                Ok(_) => {
-                    self.refresh_sessions();
-                    self.status = format!("Started {name}");
-                }
-                Err(error) => self.status = error.to_string(),
-            }
+    /// Opens the selected project's windows in the background.
+    ///
+    /// `switch` is remembered for when every window has been opened or has failed.
+    /// Enter and `s` do nothing while that work is still in progress. An existing
+    /// session is switched to immediately when `switch` is set.
+    fn begin_session(&mut self, tx: Sender<Action>, switch: bool) {
+        let Some(name) = self.selected_session_name() else {
+            return;
+        };
+        if self.starting.contains_key(&self.selected) {
+            return;
         }
+        if self.sessions.iter().any(|session| session.name == name) {
+            if switch {
+                self.status = match self.session_backend.switch_to(&name) {
+                    Ok(()) => format!("Switched to {name}"),
+                    Err(error) => error.to_string(),
+                };
+                self.refresh_sessions();
+            } else {
+                self.status = format!("{name} is already running");
+            }
+            return;
+        }
+        self.starting.insert(self.selected.clone(), switch);
+        self.status = format!("Starting {name}");
+        let path = self.selected.clone();
+        let create_path = path.clone();
+        let backend = self.session_backend.clone();
+        let editor = self.settings.editor_for(&path).to_owned();
+        let agent = self.settings.agent_for(&path).to_owned();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                backend.create(&create_path, &editor, &agent).map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            let _ = tx.send(Action::SessionStartFinished { path, result }).await;
+        });
     }
 
-    fn activate_session(&mut self) {
-        if let Some(name) = self.selected_session_name() {
-            let editor = self.settings.editor_for(&self.selected);
-            let agent = self.settings.agent_for(&self.selected);
-            let result = if self.sessions.iter().any(|session| session.name == name) {
-                self.session_backend.switch_to(&name)
-            } else {
-                self.session_backend
-                    .create(&self.selected, editor, agent)
-                    .and_then(|_| self.session_backend.switch_to(&name))
-            };
-            match result {
-                Ok(()) => self.status = format!("Switched to {name}"),
-                Err(error) => self.status = error.to_string(),
+    fn finish_session_start(&mut self, path: PathBuf, result: Result<CreatedSession, String>) {
+        let switch = self.starting.remove(&path).unwrap_or(false);
+        let created = match result {
+            Ok(created) => created,
+            Err(error) => {
+                self.status = error;
+                return;
             }
+        };
+        self.refresh_sessions();
+        let session_exists = self.sessions.iter().any(|session| session.name == created.name);
+        let switched = if switch && session_exists {
+            let switched = self.session_backend.switch_to(&created.name);
             self.refresh_sessions();
-        }
+            Some(switched)
+        } else {
+            None
+        };
+        self.status = if !created.errors.is_empty() {
+            let mut status = created.errors.join("; ");
+            if let Some(Err(error)) = &switched {
+                status.push_str("; ");
+                status.push_str(&error.to_string());
+            }
+            status
+        } else if let Some(Err(error)) = &switched {
+            error.to_string()
+        } else if switched.is_some() {
+            format!("Switched to {}", created.name)
+        } else if session_exists {
+            format!("Started {}", created.name)
+        } else {
+            format!("{} failed to open a session", created.name)
+        };
     }
 
     fn request_stop_session(&mut self) {
@@ -1062,6 +1117,9 @@ impl AppState {
         let index = self.active_sessions.as_ref().map(|popup| popup.selected).unwrap_or(0);
         let path =
             self.active_session_projects().into_iter().nth(index).map(|project| project.path);
+        if path.as_ref().is_some_and(|path| self.starting.contains_key(path)) {
+            return;
+        }
         self.active_sessions = None;
         if let Some(path) = path {
             let concealed = path
@@ -1071,8 +1129,8 @@ impl AppState {
             if concealed {
                 self.show_hidden = true;
             }
-            self.select_path(path, tx);
-            self.activate_session();
+            self.select_path(path, tx.clone());
+            self.begin_session(tx, true);
         }
     }
 
@@ -2098,5 +2156,142 @@ mod tests {
         let revealed = state.visible_rows();
         assert!(revealed.iter().any(|row| row.path == intermediate && row.hidden));
         assert!(revealed.iter().any(|row| row.path == project && !row.hidden));
+    }
+
+    #[test]
+    fn enter_does_not_open_a_session_that_is_still_starting() {
+        let (home, repositories, _, _) = tree();
+        let repository = home.join("my-repo");
+        let mut state = AppState::new(
+            home,
+            repositories,
+            SessionBackend::new("/nonexistent-canopy-test-tmux"),
+            Settings::default(),
+            None,
+        );
+        state.selected = repository.clone();
+        state.sessions.push(Session {
+            name: Session::name_for_path(&repository),
+            attached_clients: 0,
+            working_directory: repository.clone(),
+            windows: Vec::new(),
+        });
+        state.starting.insert(repository, true);
+        state.status = "Starting my-repo".into();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        state.begin_session(tx.clone(), true);
+        assert_eq!(state.status, "Starting my-repo");
+        assert!(state.starting.values().any(|switch| *switch));
+        state.open_active_sessions();
+        state.handle_active_sessions_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx);
+        assert!(state.active_sessions.is_some());
+        assert_eq!(state.status, "Starting my-repo");
+    }
+
+    #[test]
+    fn finished_start_reports_window_failures_and_then_counts_as_started() {
+        use crate::backend::sessions::CreatedSession;
+        let (home, repositories, _, _) = tree();
+        let repository = home.join("my-repo");
+        let mut state = AppState::new(
+            home,
+            repositories,
+            SessionBackend::new("/nonexistent-canopy-test-tmux"),
+            Settings::default(),
+            None,
+        );
+        let name = Session::name_for_path(&repository);
+        state.sessions.push(Session {
+            name: name.clone(),
+            attached_clients: 0,
+            working_directory: repository.clone(),
+            windows: Vec::new(),
+        });
+        state.starting.insert(repository.clone(), true);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        state
+            .handle_background_action(
+                Action::SessionStartFinished {
+                    path: repository.clone(),
+                    result: Ok(CreatedSession {
+                        name,
+                        errors: vec!["my-repo failed to open window agent: timed out".into()],
+                    }),
+                },
+                tx,
+            )
+            .unwrap();
+        assert!(!state.starting.contains_key(&repository));
+        assert!(state.status.contains("my-repo failed to open window agent: timed out"));
+        assert!(
+            state.status.contains(';'),
+            "switch should be attempted after the windows finish: {}",
+            state.status
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_a_project_stays_starting_until_every_window_is_attempted() {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let root = std::env::temp_dir().join(format!(
+            "canopy-start-test-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        let project = project.canonicalize().unwrap();
+        let executable = root.join("tmux");
+        let log = root.join("commands.log");
+        let name = Session::name_for_path(&project);
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$1\" in\nlist-sessions) printf '{name}\\t0\\t{project}\\n' ;;\nlist-windows) printf '{name}\\t0\\t@1\\t1\\t1\\tnvim\\teditor\\t{project}\\n' ;;\n*)\n  window=\n  prev=\n  for arg in \"$@\"; do\n    if [ \"$prev\" = -n ]; then window=\"$arg\"; fi\n    prev=\"$arg\"\n  done\n  if [ \"$window\" = agent ]; then echo agent failed >&2; exit 1; fi\n  ;;\nesac\n",
+                log = log.display(),
+                name = name,
+                project = project.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut state = AppState::new(
+            root.clone(),
+            vec![Repository {
+                path: project.clone(),
+                projects: vec![Project::new(project.clone(), vec![ProjectKind::Git], None)],
+            }],
+            SessionBackend::new(&executable),
+            Settings::default(),
+            None,
+        );
+        state.selected = project.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        state.begin_session(tx.clone(), true);
+        assert_eq!(state.starting.get(&project), Some(&true));
+        let status = state.status.clone();
+        state.begin_session(tx.clone(), true);
+        assert_eq!(state.status, status);
+        assert_eq!(state.starting.len(), 1);
+        let action =
+            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        state.handle_background_action(action, tx).unwrap();
+        assert!(!state.starting.contains_key(&project));
+        let project_name = project.file_name().unwrap().to_string_lossy();
+        assert!(state.status.contains(&format!("{project_name} failed to open window agent")));
+        let recorded = fs::read_to_string(&log).unwrap();
+        assert!(
+            recorded.contains("switch-client") || state.status.contains("cannot switch"),
+            "status: {}\nlog:\n{recorded}",
+            state.status
+        );
+        assert_eq!(recorded.matches("new-session").count(), 1);
+        assert!(recorded.contains("-n terminal"));
+        assert!(recorded.contains("-n git"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

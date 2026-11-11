@@ -1,7 +1,11 @@
 use std::{
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
+
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A tmux session known to the local tmux server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +28,14 @@ pub struct Window {
     pub working_directory: PathBuf,
 }
 
+/// A project session after every window has been opened or has failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedSession {
+    pub name: String,
+    /// One entry per window that failed, including timeouts.
+    pub errors: Vec<String>,
+}
+
 /// Errors returned by the tmux session backend.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -41,6 +53,7 @@ pub enum SessionError {
 #[derive(Clone, Debug)]
 pub struct SessionBackend {
     executable: PathBuf,
+    command_timeout: Duration,
 }
 
 impl Default for SessionBackend {
@@ -52,7 +65,14 @@ impl Default for SessionBackend {
 impl SessionBackend {
     /// Creates a backend using the supplied tmux executable.
     pub fn new(executable: impl Into<PathBuf>) -> Self {
-        Self { executable: executable.into() }
+        Self { executable: executable.into(), command_timeout: DEFAULT_COMMAND_TIMEOUT }
+    }
+
+    /// Overrides how long each tmux command may run before it fails.
+    #[cfg(test)]
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
     }
 
     /// Lists sessions currently known to the tmux server.
@@ -86,60 +106,94 @@ impl SessionBackend {
     /// Creates a detached project session rooted at `project_path`.
     ///
     /// The first two tmux windows run the supplied editor and agent commands,
-    /// followed by a shell window and a `git` window running `lazygit`.
+    /// followed by a shell window and a `git` window running `lazygit`. A failed
+    /// or timed-out window is recorded and the remaining windows are still opened.
+    /// The session is ready only after every window has been attempted.
     pub fn create(
         &self,
         project_path: &Path,
         editor_command: &str,
         agent_command: &str,
-    ) -> Result<String, SessionError> {
+    ) -> Result<CreatedSession, SessionError> {
         let path = project_path.canonicalize().map_err(|error| {
             SessionError::Command(format!("cannot resolve {}: {error}", project_path.display()))
         })?;
         let name = Session::name_for_path(&path);
-        self.command_owned(vec![
-            "new-session".into(),
-            "-d".into(),
-            "-s".into(),
-            name.clone(),
-            "-n".into(),
-            "editor".into(),
-            "-c".into(),
-            path.display().to_string(),
-            editor_command.into(),
-        ])?;
-        self.command_owned(vec![
-            "new-window".into(),
-            "-t".into(),
-            name.clone(),
-            "-n".into(),
-            "agent".into(),
-            "-c".into(),
-            path.display().to_string(),
-            agent_command.into(),
-        ])?;
-        self.command_owned(vec![
-            "new-window".into(),
-            "-t".into(),
-            name.clone(),
-            "-n".into(),
-            "terminal".into(),
-            "-c".into(),
-            path.display().to_string(),
-        ])?;
-        self.command_owned(vec![
-            "new-window".into(),
-            "-t".into(),
-            name.clone(),
-            "-n".into(),
-            "git".into(),
-            "-c".into(),
-            path.display().to_string(),
-            "lazygit".into(),
-        ])?;
+        let project = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
+        let directory = path.display().to_string();
+        let windows = [
+            (
+                "editor",
+                vec![
+                    "new-session".into(),
+                    "-d".into(),
+                    "-s".into(),
+                    name.clone(),
+                    "-n".into(),
+                    "editor".into(),
+                    "-c".into(),
+                    directory.clone(),
+                    editor_command.into(),
+                ],
+            ),
+            (
+                "agent",
+                vec![
+                    "new-window".into(),
+                    "-t".into(),
+                    name.clone(),
+                    "-n".into(),
+                    "agent".into(),
+                    "-c".into(),
+                    directory.clone(),
+                    agent_command.into(),
+                ],
+            ),
+            (
+                "terminal",
+                vec![
+                    "new-window".into(),
+                    "-t".into(),
+                    name.clone(),
+                    "-n".into(),
+                    "terminal".into(),
+                    "-c".into(),
+                    directory.clone(),
+                ],
+            ),
+            (
+                "git",
+                vec![
+                    "new-window".into(),
+                    "-t".into(),
+                    name.clone(),
+                    "-n".into(),
+                    "git".into(),
+                    "-c".into(),
+                    directory,
+                    "lazygit".into(),
+                ],
+            ),
+        ];
+        let mut errors = Vec::new();
+        let mut opened = false;
+        for (window, args) in windows {
+            match self.command_owned(args) {
+                Ok(_) => opened = true,
+                Err(error) => errors.push(format!(
+                    "{project} failed to open window {window}: {}",
+                    failure_reason(&error)
+                )),
+            }
+        }
         // `new-window` activates the window it creates; start from the first one.
-        self.command_owned(vec!["select-window".into(), "-t".into(), format!("={name}:^")])?;
-        Ok(name)
+        if opened
+            && let Err(error) =
+                self.command_owned(vec!["select-window".into(), "-t".into(), format!("={name}:^")])
+        {
+            errors.push(format!("{project} failed to open window: {}", failure_reason(&error)));
+        }
+        Ok(CreatedSession { name, errors })
     }
 
     /// Switches to the exact session, preserving its active window and pane.
@@ -195,16 +249,64 @@ impl SessionBackend {
         self.command_owned(args.into_iter().map(str::to_owned).collect())
     }
     fn command_owned(&self, args: Vec<String>) -> Result<String, SessionError> {
-        let output = Command::new(&self.executable)
-            .args(args)
-            .output()
-            .map_err(|error| SessionError::Unavailable(error.to_string()))?;
-        if !output.status.success() {
-            return Err(SessionError::Command(
-                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            ));
+        let mut command = Command::new(&self.executable);
+        command.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        let mut child =
+            command.spawn().map_err(|error| SessionError::Unavailable(error.to_string()))?;
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stdout.take() {
+                        let _ = pipe.read_to_string(&mut stdout);
+                    }
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    if !status.success() {
+                        let message = stderr.trim();
+                        return Err(SessionError::Command(if message.is_empty() {
+                            "command failed".into()
+                        } else {
+                            message.to_owned()
+                        }));
+                    }
+                    return Ok(stdout);
+                }
+                Ok(None) if started.elapsed() >= self.command_timeout => {
+                    kill_child(&child);
+                    let _ = child.wait();
+                    return Err(SessionError::Command("timed out".into()));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => return Err(SessionError::Unavailable(error.to_string())),
+            }
+        }
+    }
+}
+
+fn failure_reason(error: &SessionError) -> String {
+    match error {
+        SessionError::Command(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn kill_child(child: &std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
     }
 }
 
@@ -538,5 +640,69 @@ mod tests {
     fn prepare_host_session_requires_tmux() {
         let recorded = prepare_host_session_with_listing("0\t1\t/tmp\n", None);
         assert!(recorded.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn create_with_fake_tmux(agent: &str) -> (String, CreatedSession, String) {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let temp = std::env::temp_dir().join(format!(
+            "canopy-create-test-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(temp.join(".git")).unwrap();
+        let executable = temp.join("tmux");
+        let log = temp.join("commands.log");
+        let agent_body = match agent {
+            "timeout" => "if [ \"$window\" = agent ]; then sleep 5; fi\n",
+            "error" => "if [ \"$window\" = agent ]; then echo agent failed >&2; exit 1; fi\n",
+            _ => "",
+        };
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nwindow=\nprev=\nfor arg in \"$@\"; do\n  if [ \"$prev\" = -n ]; then window=\"$arg\"; fi\n  prev=\"$arg\"\ndone\n{agent_body}case \"$1\" in new-session|new-window|select-window) ;; *) exit 1 ;; esac\n",
+                log = log.display(),
+                agent_body = agent_body,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let created = SessionBackend::new(&executable)
+            .with_command_timeout(Duration::from_millis(200))
+            .create(&temp, "nvim", "codex")
+            .unwrap();
+        let recorded = fs::read_to_string(&log).unwrap_or_default();
+        let project = temp.file_name().unwrap().to_string_lossy().into_owned();
+        fs::remove_dir_all(&temp).unwrap();
+        (project, created, recorded)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_opens_remaining_windows_when_one_fails() {
+        let (project, created, recorded) = create_with_fake_tmux("error");
+        assert!(recorded.lines().any(|line| line.contains("-n terminal")));
+        assert!(recorded.lines().any(|line| line.contains("-n git")));
+        assert!(recorded.lines().any(|line| line.starts_with("select-window ")));
+        assert_eq!(
+            created.errors,
+            vec![format!("{project} failed to open window agent: agent failed")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_reports_a_timed_out_window_and_opens_the_rest() {
+        let (project, created, recorded) = create_with_fake_tmux("timeout");
+        assert!(recorded.lines().any(|line| line.contains("-n terminal")));
+        assert!(recorded.lines().any(|line| line.contains("-n git")));
+        assert_eq!(
+            created.errors,
+            vec![format!("{project} failed to open window agent: timed out")]
+        );
     }
 }
