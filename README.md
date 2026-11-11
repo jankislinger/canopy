@@ -17,9 +17,9 @@ The application currently:
 - displays a filesystem-style project tree with Git/Python/Rust indicators;
 - supports arrow-key navigation and directory expansion/collapse;
 - creates persistent tmux project sessions with editor, agent, terminal, and git (`lazygit`) windows;
-- switches to the selected project's last active tmux window with `Enter` (creating its session if needed);
-- shows running/attached sessions and their windows in Details, refreshed every second;
-- opens a popup of every project with an active session on `a`, and switches to the selected one with `Enter`;
+- switches to the selected project's last active tmux window with `Enter` (creating its session if needed). While its windows are opening the project shows as starting, and Enter does not switch until every window has opened or failed;
+- shows starting, running, and attached sessions and their windows in Details, refreshed every second;
+- opens a popup of every project with an active session on `a`, and switches to the selected one with `Enter` once it is no longer starting;
 - lists the selected project's Just recipes, including parameters and descriptions, in Details when it has a justfile;
 - opens a floating Just recipe picker with `:`; fuzzy-search names and descriptions, select with arrows, then press `Enter` to stream its output like test/lint commands;
 - opens a window with `o` followed by its actual tmux index (`0`–`9`), for example `o1` for window 1; `Esc` cancels the prefix;

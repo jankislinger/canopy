@@ -48,6 +48,10 @@ pub enum Action {
         generation: u64,
         result: Result<Vec<crate::backend::sessions::Session>, String>,
     },
+    SessionStartFinished {
+        path: std::path::PathBuf,
+        result: Result<crate::backend::sessions::CreatedSession, String>,
+    },
     JustRecipesLoaded {
         generation: u64,
         path: std::path::PathBuf,

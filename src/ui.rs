@@ -62,6 +62,19 @@ fn commands_block(s: &AppState) -> Block<'static> {
     block.title(Line::from(hint).right_aligned().style(Style::default().fg(Color::Yellow)))
 }
 
+fn session_status(starting: bool, session: Option<&Session>, compact: bool) -> &'static str {
+    if starting {
+        return if compact { "◐" } else { "◐  starting" };
+    }
+    match session {
+        Some(_) if compact => "●",
+        None if compact => "○",
+        Some(session) if session.attached_clients > 0 => "●  attached",
+        Some(_) => "●   running",
+        None => "○   stopped",
+    }
+}
+
 /// Renders the project tree, details pane, and command hints.
 pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
     if s.initializing {
@@ -107,13 +120,11 @@ pub fn draw(f: &mut ratatui::Frame, s: &mut AppState) {
                 .as_ref()
                 .map(|_| {
                     let name = Session::name_for_path(&r.path);
-                    match s.sessions.iter().find(|session| session.name == name) {
-                        Some(_) if compact_status => "●",
-                        None if compact_status => "○",
-                        Some(session) if session.attached_clients > 0 => "●  attached",
-                        Some(_) => "●   running",
-                        None => "○   stopped",
-                    }
+                    session_status(
+                        s.starting.contains_key(&r.path),
+                        s.sessions.iter().find(|session| session.name == name),
+                        compact_status,
+                    )
                 })
                 .unwrap_or("");
             let mut left = format!(
@@ -369,7 +380,9 @@ fn draw_active_sessions(f: &mut ratatui::Frame, s: &AppState) {
                     1 => "1 window".to_owned(),
                     count => format!("{count} windows"),
                 };
-                let status = if project.attached_clients > 0 {
+                let status = if s.starting.contains_key(&project.path) {
+                    "starting".to_owned()
+                } else if project.attached_clients > 0 {
                     format!("attached ({})", project.attached_clients)
                 } else {
                     "running".to_owned()
@@ -515,18 +528,22 @@ fn details(s: &AppState) -> Paragraph<'_> {
     } else {
         lines.push(Line::from("Not in a Git repository"));
     }
-    if let Some(session) = s.selected_session() {
+    let starting = s.starting.contains_key(&s.selected);
+    if starting || s.selected_session().is_some() {
+        let session = s.selected_session();
+        let name = session
+            .map(|session| session.name.clone())
+            .unwrap_or_else(|| Session::name_for_path(&s.selected));
+        let session_state = if starting {
+            "starting".to_owned()
+        } else if session.is_some_and(|session| session.attached_clients > 0) {
+            format!("attached ({} clients)", session.unwrap().attached_clients)
+        } else {
+            "running".into()
+        };
         lines.push(Line::from(""));
-        lines.push(Line::from(format!(
-            "tmux: {} · {}",
-            session.name,
-            if session.attached_clients > 0 {
-                format!("attached ({} clients)", session.attached_clients)
-            } else {
-                "running".into()
-            }
-        )));
-        for window in &session.windows {
+        lines.push(Line::from(format!("tmux: {name} · {session_state}")));
+        for window in session.map(|session| session.windows.as_slice()).unwrap_or(&[]) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(
@@ -583,7 +600,10 @@ mod tests {
         config::Settings,
     };
     use ratatui::{Terminal, backend::TestBackend};
-    use std::{collections::HashSet, path::PathBuf};
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+    };
 
     fn test_state() -> AppState {
         AppState {
@@ -602,6 +622,7 @@ mod tests {
             spinner: 0,
             status: String::new(),
             sessions: Vec::new(),
+            starting: HashMap::new(),
             open_window_pending: false,
             session_backend: SessionBackend::default(),
             confirmation: None,
@@ -770,6 +791,47 @@ mod tests {
             assert!(text.contains("3: agent * · 2 panes · codex"));
             assert!(text.contains("123456"));
         }
+    }
+
+    #[test]
+    fn starting_project_uses_a_distinct_indicator() {
+        use crate::{
+            app::ActiveSessions,
+            backend::sessions::{Session, Window},
+        };
+        let mut state = test_state();
+        state.repositories.push(Repository {
+            path: state.selected.clone(),
+            projects: vec![Project::new(state.selected.clone(), vec![ProjectKind::Git], None)],
+        });
+        for ancestor in state.selected.ancestors().skip(1) {
+            state.expanded.insert(ancestor.to_path_buf());
+        }
+        state.sessions.push(Session {
+            name: Session::name_for_path(&state.selected),
+            attached_clients: 2,
+            working_directory: state.selected.clone(),
+            windows: vec![Window {
+                index: 1,
+                id: "@1".into(),
+                name: "editor".into(),
+                active: true,
+                pane_count: 1,
+                command: "nvim".into(),
+                working_directory: state.selected.clone(),
+            }],
+        });
+        state.starting.insert(state.selected.clone(), true);
+        state.active_sessions = Some(ActiveSessions { selected: 0 });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("◐  starting"), "{text}");
+        assert!(text.contains("tmux:"));
+        assert!(text.contains(" · starting"));
+        assert!(!text.contains("attached"));
+        assert!(text.contains("starting · 1 window"));
     }
 
     #[test]
