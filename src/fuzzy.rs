@@ -61,7 +61,6 @@ fn match_term(text: &[char], term: &str) -> Option<Match> {
             }
             let mut candidate: Option<(i64, usize)> = None;
             #[allow(clippy::needless_range_loop)]
-            #[allow(clippy::needless_range_loop)]
             for k in (i - 1)..j {
                 let Some(previous) = best[i - 1][k] else { continue };
                 let score = if k + 1 == j {
