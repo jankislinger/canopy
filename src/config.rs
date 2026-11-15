@@ -119,16 +119,18 @@ impl Settings {
     }
 
     pub fn editor_for(&self, path: &Path) -> &str {
-        self.override_for(path)
-            .and_then(|settings| settings.commands.as_ref())
-            .and_then(|commands| commands.editor.as_deref())
+        path.ancestors()
+            .filter_map(|ancestor| self.override_for(ancestor))
+            .filter_map(|settings| settings.commands.as_ref())
+            .find_map(|commands| commands.editor.as_deref())
             .unwrap_or(&self.editor)
     }
 
     pub fn agent_for(&self, path: &Path) -> &str {
-        self.override_for(path)
-            .and_then(|settings| settings.commands.as_ref())
-            .and_then(|commands| commands.agent.as_deref())
+        path.ancestors()
+            .filter_map(|ancestor| self.override_for(ancestor))
+            .filter_map(|settings| settings.commands.as_ref())
+            .find_map(|commands| commands.agent.as_deref())
             .unwrap_or(&self.agent)
     }
 
@@ -267,6 +269,40 @@ mod tests {
         assert_eq!(settings.editor_for(project), "nvim --listen socket");
         assert_eq!(settings.agent_for(project), "codex --full-auto");
         assert_eq!(settings.display_for(project), DisplayMode::Hidden);
+    }
+
+    #[test]
+    fn inherits_commands_independently_from_nearest_parent() {
+        let settings = parse(
+            r#"{
+                "commands": { "editor": "global-editor", "agent": "global-agent" },
+                "directory_overrides": {
+                    "~": { "commands": { "editor": "home-editor" } },
+                    "~/Projects": { "commands": { "agent": "parent-agent" } },
+                    "~/Projects/team": { "commands": { "agent": "team-agent" } },
+                    "~/Projects/team/repo": { "commands": { "editor": "project-editor" } },
+                    "~/Projects/team/repo/service": { "display": "collapsed" }
+                }
+            }"#,
+            Path::new("/home/test"),
+        )
+        .unwrap();
+
+        for (path, editor, agent) in [
+            ("/home/test/Projects/repo", "home-editor", "parent-agent"),
+            ("/home/test/Projects/team/other", "home-editor", "team-agent"),
+            ("/home/test/Projects/team/repo", "project-editor", "team-agent"),
+            ("/home/test/Projects/team/repo/service", "project-editor", "team-agent"),
+            ("/home/test/Projects-other/repo", "home-editor", "global-agent"),
+            ("/elsewhere/repo", "global-editor", "global-agent"),
+        ] {
+            assert_eq!(settings.editor_for(Path::new(path)), editor, "{path}");
+            assert_eq!(settings.agent_for(Path::new(path)), agent, "{path}");
+        }
+        assert_eq!(
+            settings.display_for(Path::new("/home/test/Projects/team/repo/service/child")),
+            DisplayMode::Expanded
+        );
     }
 
     #[test]
